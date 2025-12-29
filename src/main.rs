@@ -16,6 +16,7 @@ use anyhow::{Context, anyhow};
 mod adapter;
 mod app;
 mod bug_report;
+mod config;
 mod logger;
 mod scroll_tiler;
 mod system;
@@ -34,14 +35,14 @@ pub fn root_dir() -> anyhow::Result<PathBuf> {
 }
 
 fn main() {
-    let default_hook = panic::take_hook();
-    panic::set_hook(Box::new(move |info| {
-        log::error!("Winri panicked: {info}");
-        bug_report::display_and_exit(info);
-        system::restore_windows();
-        default_hook(info);
-        std::process::exit(1);
-    }));
+    // let default_hook = panic::take_hook();
+    // panic::set_hook(Box::new(move |info| {
+    //     log::error!("Winri panicked: {info}");
+    //     bug_report::display_and_exit(info);
+    //     system::restore_windows();
+    //     default_hook(info);
+    //     std::process::exit(1);
+    // }));
 
     if let Err(e) = logger::setup()
         .context("Could not initialize log system, no log will be written for this session")
@@ -50,6 +51,12 @@ fn main() {
     }
 
     log::info!("Winri starting up");
+
+    let config = config::load().unwrap();
+
+    println!("{config:#?}");
+
+    return;
 
     if let Err(e) = iced::daemon(
         app::State::new,

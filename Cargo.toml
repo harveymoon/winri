@@ -18,6 +18,9 @@ itertools = "0"
 keyboard-types = { version = "0.8", features = ["std", "serde"] }
 dirs = "6"
 webbrowser = "1"
+serde = { version = "1", features = ["derive", "std"] }
+koto = "0.16"
+
 
 [dependencies.windows]
 version = "0.62"

@@ -1,0 +1,8 @@
+# Lib provided by Winri
+# Edit at your own risk!
+
+tiler = ||
+  padding: 8.0
+
+config = ||
+  tiler: tiler()

@@ -1,5 +1,6 @@
-from tiler import tiler
-
-export {
-  tiler,
-}
+config =
+  tiler:
+    padding: 8.0
+    border_color: "#44475a"
+    border_width: 2.0
+    border_radius: 12.0

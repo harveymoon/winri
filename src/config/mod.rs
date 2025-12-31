@@ -1,23 +1,23 @@
+mod default;
+
 use std::fs;
 
-use koto::{
-    CompileArgs, Koto, KotoSettings,
-    runtime::{KValue, KotoVmSettings},
-    serde::from_koto_value,
-};
+use koto::{CompileArgs, Koto, runtime::KValue, serde::from_koto_value};
 
 /// Winri configuration
 
-#[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
+#[derive(serde::Deserialize, Debug, Clone)]
 pub struct Root {
     pub tiler: Tiler,
 }
 
-#[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
+#[derive(serde::Deserialize, Debug, Clone)]
 pub struct Tiler {
+    #[serde(default = "default::padding")]
     padding: f32,
-    border_color: iced::Color,
+    #[serde(default = "default::border_width")]
     border_width: f32,
+    #[serde(default = "default::border_radius")]
     border_radius: f32,
 }
 

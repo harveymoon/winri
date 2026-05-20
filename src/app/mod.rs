@@ -2,6 +2,7 @@
 mod action;
 pub mod model;
 mod service;
+pub mod settings;
 mod subscription;
 pub mod task;
 mod view;
@@ -22,7 +23,7 @@ use crate::{
         },
         subscription::global::GlobalMessage,
     },
-    assert_log_fail,
+    assert_log_fail, config,
     scroll_tiler::ScrollTiler,
     system,
     utils::math::Size,
@@ -34,6 +35,8 @@ pub struct State {
     pub mode: Mode,
     pub configuration: model::Configuration,
     overlay_window_id: iced::window::Id,
+    settings_window_id: Option<iced::window::Id>,
+    settings_form: settings::SettingsForm,
 }
 
 pub enum Mode {
@@ -55,6 +58,12 @@ pub enum Message {
     Overview(overview::Message),
 
     Global(subscription::global::GlobalMessage),
+
+    Settings(settings::SettingsMessage),
+
+    /// Left mouse button pressed on an iced window. Used in Overview mode
+    /// to jump to the clicked thumbnail's source window.
+    WindowClicked(iced::window::Id),
 
     CleanupAndExit,
 }
@@ -78,10 +87,27 @@ fn create_overlay_window(screen_size: Size) -> (iced::window::Id, Task<Message>)
     (id, task.then(iced::window::enable_mouse_passthrough))
 }
 
+fn create_settings_window() -> (iced::window::Id, Task<Message>) {
+    let (id, task) = iced::window::open(Settings {
+        decorations: true,
+        transparent: false,
+        resizable: true,
+        closeable: true,
+        size: iced::Size::new(560.0, 640.0),
+        min_size: Some(iced::Size::new(420.0, 420.0)),
+        ..Default::default()
+    });
+    (id, task.discard())
+}
+
 impl State {
     pub fn new() -> (Self, Task<Message>) {
         let screen_size = system::screen_size().expect("Screen size retrieval");
-        let tiler = ScrollTiler::new(10.0, 20.0, screen_size);
+        let (padding, resize_increment) = {
+            let cfg = config::current();
+            (cfg.tiling.padding, cfg.tiling.resize_increment)
+        };
+        let tiler = ScrollTiler::new(padding, resize_increment, screen_size);
         let (overlay_window_id, overlay_window_creation_task) = create_overlay_window(screen_size);
         (
             Self {
@@ -95,9 +121,29 @@ impl State {
                     },
                 },
                 overlay_window_id,
+                settings_window_id: None,
+                settings_form: settings::SettingsForm::default(),
             },
             overlay_window_creation_task,
         )
+    }
+
+    fn open_settings(&mut self) -> Task<Message> {
+        if let Some(existing) = self.settings_window_id {
+            return iced::window::gain_focus(existing);
+        }
+        self.settings_form = settings::SettingsForm::from_current_config();
+        let (id, task) = create_settings_window();
+        self.settings_window_id = Some(id);
+        task
+    }
+
+    fn close_settings(&mut self) -> Task<Message> {
+        if let Some(id) = self.settings_window_id.take() {
+            iced::window::close(id)
+        } else {
+            Task::none()
+        }
     }
 
     pub fn title(_: &Self, _window_id: iced::window::Id) -> String {
@@ -133,6 +179,19 @@ impl State {
                     task = task.chain(action_task);
                 }
             }
+            Message::Settings(settings_message) => {
+                let close = settings::update(&mut self.settings_form, settings_message);
+                if close {
+                    task = task.chain(self.close_settings());
+                }
+            }
+            Message::WindowClicked(window_id) => {
+                if let Some(target) = self.window_at_thumbnail_id(window_id) {
+                    task = task.chain(Task::done(Message::Action(action::Action::Overview(
+                        action::OverviewAction::JumpTo(target),
+                    ))));
+                }
+            }
         }
         if matches!(self.mode, Mode::Exit) {
             task = task.chain(Task::done(Message::CleanupAndExit));
@@ -160,6 +219,8 @@ impl State {
     pub fn view(&self, window_id: iced::window::Id) -> iced::Element<'_, Message> {
         if window_id == self.overlay_window_id {
             view::overlay::view(self)
+        } else if Some(window_id) == self.settings_window_id {
+            settings::view(&self.settings_form)
         } else {
             view::empty()
         }
@@ -180,7 +241,24 @@ impl State {
     }
 
     pub fn subscription(_: &Self) -> iced::Subscription<Message> {
-        iced::Subscription::run(subscription::global::subscription)
+        iced::Subscription::batch([
+            iced::Subscription::run(subscription::global::subscription),
+            iced::event::listen_with(on_event),
+        ])
+    }
+}
+
+fn on_event(
+    event: iced::Event,
+    _status: iced::event::Status,
+    window_id: iced::window::Id,
+) -> Option<Message> {
+    use iced::mouse::{Button, Event as MouseEvent};
+
+    if matches!(event, iced::Event::Mouse(MouseEvent::ButtonPressed(Button::Left))) {
+        Some(Message::WindowClicked(window_id))
+    } else {
+        None
     }
 }
 

@@ -102,13 +102,14 @@ pub fn thumbnail_window_creation_task(
                 .then(move |raw_handle| Task::done((id, raw_handle)))
         })
         .then(move |(id, raw_handle)| {
-            iced::window::enable_mouse_passthrough(id).chain(Task::done(
-                overview::Message::ThumbnailWindowCreated(ThumbnailWindowCreated {
+            Task::done(overview::Message::ThumbnailWindowCreated(
+                ThumbnailWindowCreated {
                     src: source_window,
                     dest_id: id,
                     dest_raw_handle: raw_handle,
+                    pos: at,
                     size,
-                }),
+                },
             ))
         })
 }

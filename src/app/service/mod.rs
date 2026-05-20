@@ -41,6 +41,7 @@ impl app::State {
             (Mode::Tiler { .. }, Modifiers::META, Key::KeyR) => {
                 Some(Action::Tiler(TilerAction::ForceRefresh))
             }
+            (Mode::Tiler { .. }, Modifiers::META, Key::Comma) => Some(Action::OpenSettings),
             (Mode::Tiler { .. }, _, Key::LeftArrow)
                 if modifiers == Modifiers::META.union(Modifiers::SHIFT) =>
             {
@@ -105,11 +106,24 @@ impl app::State {
                     self.tiler.decrement_current_window_width();
                     self.update_tiler()?;
                 }
-                TilerAction::ForceRefresh => self.update_tiler()?,
+                TilerAction::ForceRefresh => {
+                    if let Err(e) = crate::config::reload() {
+                        log::warn!("Config reload failed, keeping previous config: {e:#}");
+                    }
+                    self.update_tiler()?;
+                }
             },
             Action::Overview(overview_action) => match overview_action {
                 OverviewAction::CloseOverview => return self.close_overview(),
+                OverviewAction::JumpTo(target) => {
+                    let close_task = self.close_overview()?;
+                    if let Err(e) = target.focus() {
+                        log::warn!("Failed to focus jump target: {e:#}");
+                    }
+                    return Ok(close_task);
+                }
             },
+            Action::OpenSettings => return Ok(self.open_settings()),
             Action::Exit => self.mode = Mode::Exit,
         }
 

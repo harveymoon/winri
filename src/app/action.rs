@@ -2,6 +2,7 @@
 pub enum Action {
     Tiler(TilerAction),
     Overview(OverviewAction),
+    OpenSettings,
     Exit,
 }
 
@@ -23,4 +24,5 @@ pub enum TilerAction {
 #[derive(Debug, Clone)]
 pub enum OverviewAction {
     CloseOverview,
+    JumpTo(crate::window::Window),
 }

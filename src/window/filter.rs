@@ -1,7 +1,7 @@
 /// Filters for windows that should be tiled.
 use std::collections::HashSet;
 
-use crate::window::Window;
+use crate::{config, window::Window};
 
 pub const WINRI_IGNORED_CLASS_NAME: &str = "Winri_IgnoreWindowClass";
 pub const WINRI_IGNORED_WINDOW_TITLE_SUBSTRING: &str = "[Winri Ignore Window]";
@@ -13,6 +13,9 @@ const IGNORED_CLASSES: &[&str] = &[
     "Xaml_WindowedPopupClass",
     "Shell_TrayWnd",
     "FindMyMouse",
+    // Win11 modern context menus (Explorer right-click and similar WinUI 3 popups)
+    // are hosted in a top-level window of this class.
+    "Microsoft.UI.Content.PopupWindowSiteBridge",
     WINRI_IGNORED_CLASS_NAME,
 ];
 
@@ -41,8 +44,16 @@ pub fn should_be_tiled(window: Window) -> anyhow::Result<bool> {
     let title = window.title()?;
     filter_out_if!(title.is_none());
     filter_out_if!(title.is_some_and(|title| title.contains(WINRI_IGNORED_WINDOW_TITLE_SUBSTRING)));
-    filter_out_if!(IGNORED_CLASSES.contains(&window.class()?.as_str()));
-    filter_out_if!(IGNORED_PROCESS_NAMES.contains(&window.process_name()?.as_str()));
+    let class = window.class()?;
+    filter_out_if!(IGNORED_CLASSES.contains(&class.as_str()));
+    let process = window.process_name()?;
+    filter_out_if!(IGNORED_PROCESS_NAMES.contains(&process.as_str()));
+
+    let user_cfg = config::current();
+    filter_out_if!(user_cfg.filter.ignored_classes.iter().any(|c| c == &class));
+    filter_out_if!(user_cfg.filter.ignored_processes.iter().any(|p| p == &process));
+    drop(user_cfg);
+
     filter_out_if!(!window.is_valid()?);
 
     Ok(true)

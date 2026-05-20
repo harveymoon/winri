@@ -13,7 +13,40 @@ use crate::{
 };
 
 pub struct State {
-    opened_thumbnails: Vec<(ThumbnailId, iced::window::Id)>,
+    opened_thumbnails: Vec<ThumbnailEntry>,
+}
+
+pub struct ThumbnailEntry {
+    pub thumbnail_id: ThumbnailId,
+    pub window_id: iced::window::Id,
+    /// The original source window this thumbnail represents.
+    pub src: Window,
+    /// Screen-space rect of the thumbnail, used for click hit-testing.
+    pub rect: ThumbnailRect,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ThumbnailRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+impl ThumbnailRect {
+    pub fn contains(&self, x: f64, y: f64) -> bool {
+        x >= self.x && x < self.x + self.width && y >= self.y && y < self.y + self.height
+    }
+}
+
+impl State {
+    /// Find the source window whose thumbnail contains the given screen point.
+    pub fn window_at(&self, x: f64, y: f64) -> Option<Window> {
+        self.opened_thumbnails
+            .iter()
+            .find(|entry| entry.rect.contains(x, y))
+            .map(|entry| entry.src)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -21,6 +54,7 @@ pub struct ThumbnailWindowCreated {
     pub src: Window,
     pub dest_id: iced::window::Id,
     pub dest_raw_handle: u64,
+    pub pos: crate::utils::math::Position,
     pub size: crate::utils::math::Size,
 }
 
@@ -82,6 +116,7 @@ impl app::State {
             src,
             dest_id,
             dest_raw_handle,
+            pos,
             size,
         }: ThumbnailWindowCreated,
     ) -> anyhow::Result<()> {
@@ -116,7 +151,17 @@ impl app::State {
         dest_window.show()?;
         dest_window.set_max_zindex()?;
 
-        thumbnails.push((thumbnail_id, dest_id));
+        thumbnails.push(ThumbnailEntry {
+            thumbnail_id,
+            window_id: dest_id,
+            src,
+            rect: ThumbnailRect {
+                x: f64::from(pos.x()),
+                y: f64::from(pos.y()),
+                width: f64::from(size.width()),
+                height: f64::from(size.height()),
+            },
+        });
 
         Ok(())
     }
@@ -135,14 +180,29 @@ impl app::State {
 
         let tasks = thumbnails
             .iter()
-            .map(|(thumbnail_id, window_id)| {
-                thumbnail::unbind_thumbnail(*thumbnail_id).map(|()| window_id)
+            .map(|entry| {
+                thumbnail::unbind_thumbnail(entry.thumbnail_id).map(|()| entry.window_id)
             })
-            .map(|window_id| window_id.map(|id| iced::window::close(*id)))
+            .map(|window_id| window_id.map(iced::window::close))
             .collect::<anyhow::Result<Vec<_>>>()?;
 
         self.switch_to_tiler_mode()?;
 
         Ok(Task::batch(tasks))
+    }
+
+    /// Find the source window for a clicked thumbnail iced window. Returns
+    /// `None` if we're not in overview mode or the id doesn't belong to a
+    /// thumbnail.
+    pub fn window_at_thumbnail_id(&self, id: iced::window::Id) -> Option<Window> {
+        if let Mode::Overview(state) = &self.mode {
+            state
+                .opened_thumbnails
+                .iter()
+                .find(|entry| entry.window_id == id)
+                .map(|entry| entry.src)
+        } else {
+            None
+        }
     }
 }

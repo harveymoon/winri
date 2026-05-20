@@ -16,6 +16,7 @@ use anyhow::{Context, anyhow};
 mod adapter;
 mod app;
 mod bug_report;
+mod config;
 mod logger;
 mod scroll_tiler;
 mod system;
@@ -50,6 +51,10 @@ fn main() {
     }
 
     log::info!("Winri starting up");
+
+    if let Err(e) = config::init() {
+        log::warn!("Failed to load user config — falling back to defaults: {e:#}");
+    }
 
     if let Err(e) = iced::daemon(
         app::State::new,

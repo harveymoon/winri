@@ -1,5 +1,8 @@
+use std::ffi::c_void;
+
 use log::warn;
 use windows::Win32::{
+    Foundation::{HWND, RECT},
     Graphics::Gdi::{COLOR_HIGHLIGHT, GetSysColor},
     UI::{
         Input::KeyboardAndMouse::{
@@ -7,10 +10,13 @@ use windows::Win32::{
             VK_RWIN, VK_SHIFT,
         },
         WindowsAndMessaging::{
-            GetDesktopWindow, GetSystemMetrics, IDYES, MB_OK, MB_YESNO, SM_CXSCREEN, SM_CYSCREEN,
+            FindWindowW, GetDesktopWindow, GetSystemMetrics, GetWindowRect, IDYES, IsWindowVisible,
+            MB_OK, MB_YESNO, SM_CXSCREEN, SM_CYSCREEN, SPI_GETWORKAREA,
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
         },
     },
 };
+use windows_strings::w;
 
 use crate::{
     utils::math::{Position, Size},
@@ -18,15 +24,112 @@ use crate::{
     window::{self, Window},
 };
 
+/// Returns the dimensions of the primary monitor's work area — i.e. the
+/// monitor rect minus the taskbar and other appbars. Tiled windows and the
+/// winri overlay should be laid out within these bounds so they don't
+/// overlap the taskbar.
+///
+/// Handling on Windows 11:
+/// - `SPI_GETWORKAREA` is the primary source of truth, but it sometimes still
+///   includes the taskbar strip (e.g. with auto-hide, or with third-party
+///   shells like ExplorerPatcher). So we also locate `Shell_TrayWnd` and
+///   subtract its full height from the bottom/right edges of the work area.
+/// - For an auto-hide taskbar we still reserve its full slide-out size. The
+///   "let it overlay tiles" approach would conflict with winri's topmost
+///   transparent overlay, so we leave an empty strip the bar can slide into
+///   instead.
+/// - We only subtract from the bottom/right edges; the rest of winri assumes
+///   the work area starts at (0, 0). A top/left taskbar would require
+///   threading an origin offset through the tiler and overlay, which is left
+///   as future work — we log a warning in that case.
 pub fn screen_size() -> anyhow::Result<Size> {
+    use anyhow::Context;
+
+    let mut work = RECT::default();
+    unsafe {
+        SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some(&raw mut work as *mut c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    }
+    .context("SystemParametersInfoW(SPI_GETWORKAREA)")?;
+
+    let screen = primary_screen_rect();
+
+    if let Some(tray) = taskbar_rect() {
+        let bar_width = tray.right - tray.left;
+        let bar_height = tray.bottom - tray.top;
+        let screen_mid_x = (screen.left + screen.right) / 2;
+        let screen_mid_y = (screen.top + screen.bottom) / 2;
+
+        if bar_width >= bar_height {
+            // Horizontal taskbar — top or bottom edge.
+            let bar_center_y = (tray.top + tray.bottom) / 2;
+            if bar_center_y >= screen_mid_y {
+                // Bottom: reserve the bar's full height regardless of whether
+                // it's currently shown (covers auto-hide).
+                work.bottom = work.bottom.min(screen.bottom - bar_height);
+            } else {
+                warn!(
+                    "Taskbar appears to be on the top edge; winri does not yet shift its layout \
+                     origin and tiled windows will overlap it."
+                );
+            }
+        } else {
+            let bar_center_x = (tray.left + tray.right) / 2;
+            if bar_center_x >= screen_mid_x {
+                work.right = work.right.min(screen.right - bar_width);
+            } else {
+                warn!(
+                    "Taskbar appears to be on the left edge; winri does not yet shift its layout \
+                     origin and tiled windows will overlap it."
+                );
+            }
+        }
+    }
+
+    if work.left != 0 || work.top != 0 {
+        warn!(
+            "Work area does not start at (0, 0): origin = ({}, {}). \
+             Tiled windows may not be positioned correctly.",
+            work.left, work.top
+        );
+    }
+
     #[allow(
         clippy::cast_precision_loss,
         reason = "The values will stay within screen size orders of magnitude"
     )]
     Ok(Size([
-        wincall_into_result!(GetSystemMetrics(SM_CXSCREEN))? as f32,
-        wincall_into_result!(GetSystemMetrics(SM_CYSCREEN))? as f32,
+        (work.right - work.left) as f32,
+        (work.bottom - work.top) as f32,
     ]))
+}
+
+/// Locate the primary taskbar window (`Shell_TrayWnd`) and return its screen
+/// rect, or `None` if it can't be found or isn't visible.
+fn taskbar_rect() -> Option<RECT> {
+    let hwnd: HWND = unsafe { FindWindowW(w!("Shell_TrayWnd"), None) }.ok()?;
+    if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+        return None;
+    }
+    let mut rect = RECT::default();
+    unsafe { GetWindowRect(hwnd, &raw mut rect) }.ok()?;
+    Some(rect)
+}
+
+/// The rect of the primary monitor in screen coordinates. The window-rs API
+/// doesn't expose a single call for this, but `SM_CXSCREEN`/`SM_CYSCREEN` give
+/// the primary monitor's dimensions and its origin is always (0, 0).
+fn primary_screen_rect() -> RECT {
+    RECT {
+        left: 0,
+        top: 0,
+        right: unsafe { GetSystemMetrics(SM_CXSCREEN) },
+        bottom: unsafe { GetSystemMetrics(SM_CYSCREEN) },
+    }
 }
 
 pub fn highlight_color() -> anyhow::Result<iced::Color> {

@@ -51,6 +51,9 @@ pub enum ApiCommand {
     ScrollBy(f32),
     /// Run one of the named keyboard-equivalent actions.
     Action(NamedAction),
+    /// Move the window with the given HWND to the monitor identified by
+    /// device name (e.g. `\\.\DISPLAY2`).
+    MoveToMonitor { hwnd: u64, device_name: String },
 }
 
 /// Returned by `GET /windows`.
@@ -64,6 +67,32 @@ pub struct WindowDescriptor {
     pub width: f32,
     pub x: f32,
     pub focused: bool,
+    pub monitor: String,
+    pub tiled: bool,
+}
+
+/// Returned by `GET /monitors`.
+#[derive(Debug, Clone, Serialize)]
+pub struct MonitorDescriptor {
+    pub index: usize,
+    pub device_name: String,
+    pub is_primary: bool,
+    pub is_tiling: bool,
+    pub work_area: WorkArea,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkArea {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+/// Body for `POST /windows/{id}/move-to-monitor`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MoveToMonitorRequest {
+    pub device_name: String,
 }
 
 /// Returned by `GET /state`.
@@ -80,6 +109,8 @@ pub struct StateResponse {
     pub total_width: f32,
     pub screen_width: f32,
     pub screen_height: f32,
+    pub tiling_monitor: String,
+    pub monitors: Vec<MonitorDescriptor>,
 }
 
 /// Returned on errors.

@@ -8,7 +8,10 @@ use tiny_http::{Header, Method, Request, Response, Server};
 use crate::{
     api::{
         ApiCommand, NamedAction, ScrollRequest, capture, current_state, send_message,
-        types::{ErrorBody, StateResponse, WindowDescriptor},
+        types::{
+            ErrorBody, MonitorDescriptor, MoveToMonitorRequest, StateResponse, WindowDescriptor,
+            WorkArea,
+        },
     },
     app::Message,
     config,
@@ -66,6 +69,14 @@ fn handle_request(request: Request) -> anyhow::Result<()> {
         (Method::Get, "" | "/") => respond_text(request, "winri control API; see /state and /windows"),
         (Method::Get, "/state") => respond_state(request),
         (Method::Get, "/windows") => respond_windows(request),
+        (Method::Get, "/monitors") => respond_monitors(request),
+        (Method::Post, path) if path.starts_with("/windows/")
+            && path.ends_with("/move-to-monitor") =>
+        {
+            let id_str =
+                &path["/windows/".len()..path.len() - "/move-to-monitor".len()];
+            handle_move_to_monitor(request, id_str)
+        }
         (Method::Get, path) if path.starts_with("/windows/") && path.ends_with("/thumbnail") => {
             let id_str = &path["/windows/".len()..path.len() - "/thumbnail".len()];
             let max_width = query.as_deref().and_then(parse_width_param);
@@ -130,36 +141,8 @@ fn content_type(value: &'static str) -> Header {
     Header::from_bytes(&b"Content-Type"[..], value.as_bytes()).expect("static header")
 }
 
-fn respond_state(request: Request) -> anyhow::Result<()> {
-    let state = current_state();
-    let response = StateResponse {
-        mode: state.mode.clone(),
-        overview_active: state.mode == "overview",
-        windows: state
-            .windows
-            .iter()
-            .map(|w| WindowDescriptor {
-                id: w.id,
-                title: w.title.clone(),
-                process: w.process.clone(),
-                class: w.class.clone(),
-                width: w.width,
-                x: w.x,
-                focused: Some(w.id) == state.focused_window_id,
-            })
-            .collect(),
-        focused_id: state.focused_window_id,
-        scroll_offset: state.scroll_offset,
-        total_width: state.total_width,
-        screen_width: state.screen_width,
-        screen_height: state.screen_height,
-    };
-    respond_json(request, 200, &response)
-}
-
-fn respond_windows(request: Request) -> anyhow::Result<()> {
-    let state = current_state();
-    let windows: Vec<WindowDescriptor> = state
+fn window_descriptors(state: &crate::api::ApiState) -> Vec<WindowDescriptor> {
+    state
         .windows
         .iter()
         .map(|w| WindowDescriptor {
@@ -170,9 +153,76 @@ fn respond_windows(request: Request) -> anyhow::Result<()> {
             width: w.width,
             x: w.x,
             focused: Some(w.id) == state.focused_window_id,
+            monitor: w.monitor.clone(),
+            tiled: w.tiled,
         })
-        .collect();
-    respond_json(request, 200, &windows)
+        .collect()
+}
+
+fn monitor_descriptors(state: &crate::api::ApiState) -> Vec<MonitorDescriptor> {
+    state
+        .monitors
+        .iter()
+        .map(|m| MonitorDescriptor {
+            index: m.index,
+            device_name: m.device_name.clone(),
+            is_primary: m.is_primary,
+            is_tiling: m.is_tiling,
+            work_area: WorkArea {
+                x: m.work_area_x,
+                y: m.work_area_y,
+                width: m.work_area_width,
+                height: m.work_area_height,
+            },
+        })
+        .collect()
+}
+
+fn respond_state(request: Request) -> anyhow::Result<()> {
+    let state = current_state();
+    let response = StateResponse {
+        mode: state.mode.clone(),
+        overview_active: state.mode == "overview",
+        windows: window_descriptors(&state),
+        focused_id: state.focused_window_id,
+        scroll_offset: state.scroll_offset,
+        total_width: state.total_width,
+        screen_width: state.screen_width,
+        screen_height: state.screen_height,
+        tiling_monitor: state.tiling_monitor_device_name.clone(),
+        monitors: monitor_descriptors(&state),
+    };
+    respond_json(request, 200, &response)
+}
+
+fn respond_windows(request: Request) -> anyhow::Result<()> {
+    let state = current_state();
+    respond_json(request, 200, &window_descriptors(&state))
+}
+
+fn respond_monitors(request: Request) -> anyhow::Result<()> {
+    let state = current_state();
+    respond_json(request, 200, &monitor_descriptors(&state))
+}
+
+fn handle_move_to_monitor(mut request: Request, id_str: &str) -> anyhow::Result<()> {
+    let hwnd: u64 = match id_str.parse() {
+        Ok(v) => v,
+        Err(_) => return respond_error(request, 400, "invalid window id"),
+    };
+    let mut body = String::new();
+    request.as_reader().read_to_string(&mut body).ok();
+    let req: MoveToMonitorRequest = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(e) => return respond_error(request, 400, &format!("invalid JSON: {e}")),
+    };
+    dispatch_command(
+        request,
+        ApiCommand::MoveToMonitor {
+            hwnd,
+            device_name: req.device_name,
+        },
+    )
 }
 
 fn handle_thumbnail(

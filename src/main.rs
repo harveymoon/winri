@@ -16,6 +16,7 @@ use windows::{
     Win32::{
         Foundation::{ERROR_ALREADY_EXISTS, GetLastError},
         System::Threading::CreateMutexW,
+        UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
     },
     core::w,
 };
@@ -25,9 +26,12 @@ mod api;
 mod app;
 mod bug_report;
 mod config;
+mod icon;
 mod logger;
+mod monitor;
 mod scroll_tiler;
 mod system;
+mod tray;
 mod utils;
 mod winapi;
 mod window;
@@ -72,6 +76,11 @@ fn acquire_single_instance() -> bool {
 }
 
 fn main() {
+    // Per-monitor V2 DPI awareness so winri talks in physical pixels and
+    // can place windows correctly on secondary monitors with different
+    // scaling factors. Must be set before any window is created.
+    let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+
     if !acquire_single_instance() {
         crate::bug_report::display_and_exit(anyhow!(
             "Another winri is already running. Exit it (Win+Esc) before launching again."
@@ -96,9 +105,17 @@ fn main() {
 
     log::info!("Winri starting up");
 
+    // Defensive cleanup: a previous winri may have been force-killed while
+    // a window had a SetWindowRgn clip applied, leaving it rendering as
+    // a blank rectangle. Clear any such regions before doing anything else.
+    system::clear_all_window_clips();
+
     if let Err(e) = config::init() {
         log::warn!("Failed to load user config — falling back to defaults: {e:#}");
     }
+
+    // Install the tray icon before iced takes over the main thread.
+    tray::launch();
 
     if let Err(e) = iced::daemon(
         app::State::new,

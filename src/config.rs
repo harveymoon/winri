@@ -20,6 +20,24 @@ pub struct Config {
     pub tiling: TilingConfig,
     pub filter: FilterConfig,
     pub api: ApiConfig,
+    pub monitors: MonitorsConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MonitorsConfig {
+    /// Which monitor hosts the tile strip. `"primary"` or a Win32 device
+    /// name like `\\.\DISPLAY1`. Windows on other monitors are left
+    /// untouched by winri.
+    pub tiling_monitor: String,
+}
+
+impl Default for MonitorsConfig {
+    fn default() -> Self {
+        Self {
+            tiling_monitor: "primary".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +92,17 @@ impl Default for TilingConfig {
 pub struct FilterConfig {
     pub ignored_processes: Vec<String>,
     pub ignored_classes: Vec<String>,
+    /// Per-window persistent ignore. Each entry exempts a specific window
+    /// of a specific app — e.g. an app's settings popup that you never
+    /// want tiled. A window is ignored when its `process_name` equals
+    /// `process` and its current title is exactly `title`.
+    pub ignored_window_titles: Vec<IgnoredWindowTitle>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IgnoredWindowTitle {
+    pub process: String,
+    pub title: String,
 }
 
 const DEFAULT_CONFIG_TOML: &str = r#"# Winri configuration
@@ -104,6 +133,13 @@ ignored_classes = [
     # "SomeOverlayClass",
 ]
 
+# Persistent per-window ignores: a window is exempted from tiling when
+# its process AND title both match an entry below. Use the overview's
+# right-click "Ignore this window" action to add these.
+ignored_window_titles = [
+    # { process = "Code.exe", title = "Welcome - Visual Studio Code" },
+]
+
 [api]
 # Local HTTP control API. When enabled, exposes endpoints to enumerate
 # tiled windows, focus them, scroll, fire keyboard-equivalent actions, and
@@ -112,6 +148,12 @@ ignored_classes = [
 enabled = false
 bind = "127.0.0.1"
 port = 47812
+
+[monitors]
+# Which monitor hosts the tile strip. "primary" follows the system primary
+# monitor; alternatively use a Win32 device name like "\\.\DISPLAY2".
+# Windows on other monitors are left as normal floating windows.
+tiling_monitor = "primary"
 "#;
 
 static CONFIG: OnceLock<RwLock<Config>> = OnceLock::new();

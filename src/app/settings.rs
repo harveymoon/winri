@@ -86,10 +86,11 @@ impl SettingsForm {
             )
         })?;
         // Preserve config fields the settings UI doesn't currently expose
-        // (api section, smooth-scroll knobs) by reading them from the live
-        // config and passing them through unchanged.
+        // (api section, smooth-scroll knobs, monitors section) by reading
+        // them from the live config and passing them through unchanged.
         let live = config::current();
         let api = live.api.clone();
+        let monitors = live.monitors.clone();
         let smooth_scroll = live.tiling.smooth_scroll;
         let smooth_scroll_factor = live.tiling.smooth_scroll_factor;
         drop(live);
@@ -104,8 +105,16 @@ impl SettingsForm {
             filter: config::FilterConfig {
                 ignored_processes: self.ignored_processes.clone(),
                 ignored_classes: self.ignored_classes.clone(),
+                // The settings UI doesn't yet expose per-window ignores;
+                // preserve any that the overview right-click added so we
+                // don't drop them on Save.
+                ignored_window_titles: config::current()
+                    .filter
+                    .ignored_window_titles
+                    .clone(),
             },
             api,
+            monitors,
         })
     }
 }

@@ -44,6 +44,9 @@ impl app::State {
             (Mode::Tiler { .. }, Modifiers::META, Key::KeyH) => {
                 Some(Action::Tiler(TilerAction::CenterFocused))
             }
+            (Mode::Tiler { .. }, Modifiers::META, Key::KeyI) => {
+                Some(Action::Tiler(TilerAction::IgnoreFocusedWindow))
+            }
             (Mode::Tiler { .. }, Modifiers::META, Key::Comma) => Some(Action::OpenSettings),
             (Mode::Tiler { .. }, _, Key::LeftArrow)
                 if modifiers == Modifiers::META.union(Modifiers::SHIFT) =>
@@ -111,6 +114,12 @@ impl app::State {
                 }
                 TilerAction::CenterFocused => {
                     self.tiler.center_focused_window();
+                }
+                TilerAction::IgnoreFocusedWindow => {
+                    if let Err(e) = self.ignore_focused_window_by_class() {
+                        log::warn!("Ignore-focused-window failed: {e:#}");
+                    }
+                    self.update_tiler()?;
                 }
                 TilerAction::ForceRefresh => {
                     if let Err(e) = crate::config::reload() {

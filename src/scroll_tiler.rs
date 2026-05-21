@@ -4,6 +4,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
+
 use anyhow::Context;
 use joy_error::log::ResultLogExt;
 use log::{debug, info, warn};
@@ -27,6 +29,13 @@ pub struct WindowItem {
     /// "re-applied the same rect" so the focus-border fade isn't disturbed
     /// by passive snapshot updates (e.g. mouse hovers triggering events).
     last_layout: Option<(f32, f32, f32, f32)>,
+    /// Most recent `SetWindowRgn` rect we applied to this window, in
+    /// window-local coords (left, top, right, bottom). `None` means the
+    /// window currently has no winri-managed clip (its full content
+    /// renders). Used to skip redundant `SetWindowRgn` calls and to know
+    /// when to call `SetWindowRgn(None)` on the transition back to full
+    /// visibility.
+    last_clip: Option<(i32, i32, i32, i32)>,
 }
 
 impl WindowItem {
@@ -36,6 +45,7 @@ impl WindowItem {
             requested_width: Some(width),
             width,
             last_layout: None,
+            last_clip: None,
         }
     }
 
@@ -46,6 +56,15 @@ impl WindowItem {
     fn requested_width(&mut self) -> Option<f32> {
         self.requested_width.take()
     }
+}
+
+/// Synchronously-queried "is the left mouse button currently down". Used
+/// to detect window drags so the tiler doesn't fight the user mid-drag.
+fn is_left_mouse_held() -> bool {
+    let raw = unsafe { GetAsyncKeyState(i32::from(VK_LBUTTON.0)) };
+    #[allow(clippy::cast_sign_loss)]
+    let bits = raw as u16;
+    bits & 0x8000 != 0
 }
 
 /// Once motion goes quiet for this long, the focus border fades back in.
@@ -79,6 +98,11 @@ pub struct ScrollTiler {
     /// Most recent time any window actually moved (scroll, layout, animation
     /// frame). Used to fade the focus border in only once the strip is still.
     last_motion: Option<Instant>,
+    /// Was the left mouse button held during the previous snapshot tick?
+    /// We compare against the current state to spot the moment a user-drag
+    /// ends, which is when we re-check whether any tiled window has been
+    /// pulled off the tiling monitor.
+    was_mouse_held_last_snapshot: bool,
 }
 
 impl ScrollTiler {
@@ -371,18 +395,91 @@ impl ScrollTiler {
         self.focus_index().map(|index| self.windows[index].inner)
     }
 
-    pub fn handle_window_snapshot(&mut self, windows_snapshot: &HashSet<Window>) {
-        if windows_snapshot.is_empty() {
-            self.windows.clear();
-            return;
+    /// One-shot startup seeding: tile every window in `snapshot`, ignoring
+    /// the per-monitor add gate. Used by the initial consolidation pass so
+    /// a fresh winri session always pulls everything onto the tiling
+    /// monitor for the user to organise from.
+    pub fn bulk_seed(&mut self, snapshot: &HashSet<Window>) {
+        for window in snapshot {
+            if !self.windows.iter().any(|item| item.inner == *window) {
+                self.windows.push(WindowItem::new(*window, self.default_size()));
+            }
         }
+        let positions = self.windows_positions();
+        self.layout_windows(&positions);
+        log::info!("bulk_seed: {} window(s) now tiled", self.windows.len());
+    }
 
+    pub fn handle_window_snapshot(
+        &mut self,
+        windows_snapshot: &HashSet<Window>,
+        tiling_hmonitor: isize,
+    ) {
+        // Drop tracked windows that no longer exist OR that the standard
+        // tile-filter has rejected (e.g. user just added the app to the
+        // ignore list). Crucially we DO NOT drop a window just because it
+        // landed off the tiling monitor — that would falsely fire any time
+        // a scroll pushed a window's center past the monitor edge. The
+        // dedicated drag-end check below handles real "user moved this to
+        // another monitor" events.
         self.windows
             .retain(|item| windows_snapshot.contains(&item.inner));
 
+        // Drag-end detection. If the user was holding left mouse last
+        // snapshot and isn't now, they just released. A tiled window
+        // counts as "user-dragged" only if its actual on-screen position
+        // has drifted from where we last placed it AND it's now on a
+        // non-tiling monitor — otherwise we'd untile windows that simply
+        // ended up on the secondary monitor because the strip overflows.
+        let mouse_held_now = is_left_mouse_held();
+        let drag_just_ended = self.was_mouse_held_last_snapshot && !mouse_held_now;
+        self.was_mouse_held_last_snapshot = mouse_held_now;
+        if drag_just_ended {
+            /// How far a window must have drifted from its last laid-out
+            /// position to count as "user dragged" rather than tiler-placed.
+            const DRAG_DETECT_PX: f32 = 50.0;
+            let before = self.windows.len();
+            self.windows.retain(|item| {
+                let on_tiling = item.inner.monitor() == tiling_hmonitor;
+                if on_tiling {
+                    return true;
+                }
+                let Some((lx, ly, _, _)) = item.last_layout else {
+                    // No baseline → trust the existing behavior and keep
+                    // the window. Will be reassessed next snapshot.
+                    return true;
+                };
+                let drifted = match item.inner.desktop_manager_bounds().ok() {
+                    Some(bounds) => {
+                        let pos = bounds.position();
+                        (pos.x() - lx).abs() > DRAG_DETECT_PX
+                            || (pos.y() - ly).abs() > DRAG_DETECT_PX
+                    }
+                    None => false,
+                };
+                if drifted {
+                    info!(
+                        "Drag-end: window {:?} moved to monitor {} and drifted from layout; untiling",
+                        item.inner.handle(),
+                        item.inner.monitor(),
+                    );
+                    false
+                } else {
+                    true
+                }
+            });
+            if before != self.windows.len() {
+                info!(
+                    "Drag-end pruned {} window(s); {} remain tiled",
+                    before - self.windows.len(),
+                    self.windows.len()
+                );
+            }
+        }
+
         self.update_widths();
 
-        self.append_new_windows(windows_snapshot);
+        self.append_new_windows(windows_snapshot, tiling_hmonitor);
 
         let windows_positions = self.windows_positions();
 
@@ -413,10 +510,21 @@ impl ScrollTiler {
         }
     }
 
-    /// Append new windows from the snapshot that are not already in the tiler.
-    /// If the focused window is tiled, new windows are appended after it.
-    /// Otherwise, they are appended at the end.
-    fn append_new_windows(&mut self, windows_snapshot: &HashSet<Window>) {
+    /// Append new windows from the snapshot that are not already in the
+    /// tiler. Gated by `tiling_hmonitor`: a window opening on a non-tiling
+    /// monitor stays floating. If the focused window is tiled, new windows
+    /// are appended after it; otherwise they are appended at the end.
+    fn append_new_windows(
+        &mut self,
+        windows_snapshot: &HashSet<Window>,
+        tiling_hmonitor: isize,
+    ) {
+        let is_addable = |w: &Window| -> bool {
+            // Only auto-tile windows that are physically on the tiling
+            // monitor. Otherwise leave them floating.
+            w.monitor() == tiling_hmonitor
+        };
+
         if !self.windows.is_empty()
             && let Some(focus_index) = self.focus_index().or(self.previously_focused_window_index)
             && focus_index < self.windows.len()
@@ -426,8 +534,9 @@ impl ScrollTiler {
                     .windows
                     .iter()
                     .any(|window_item| window_item.inner == *window)
+                    && is_addable(window)
                 {
-                    log::info!("Adding after focused {focus_index}");
+                    log::info!("Auto-tile {:?} after focused {focus_index}", window.handle());
                     self.windows.insert(
                         focus_index + 1,
                         WindowItem::new(*window, self.default_size()),
@@ -440,7 +549,9 @@ impl ScrollTiler {
                     .windows
                     .iter()
                     .any(|window_item| window_item.inner == *window)
+                    && is_addable(window)
                 {
+                    log::info!("Auto-tile {:?} at end", window.handle());
                     self.windows
                         .push(WindowItem::new(*window, self.default_size()));
                 }
@@ -455,10 +566,33 @@ impl ScrollTiler {
     }
 
     fn layout_windows(&mut self, windows_positions: &[f32]) {
+        // Don't fight the user. When the left mouse button is held the
+        // user is most likely dragging a window — including possibly out
+        // of the strip onto another monitor — and every `SetWindowPos`
+        // we'd issue here would snap it back. We skip this whole pass and
+        // pick up again on the snapshot after they release the button.
+        if is_left_mouse_held() {
+            return;
+        }
+
         // A rect "actually changed" tolerance — DWM bounds round-trips can
         // jitter a fraction of a pixel; we don't want to count that as
         // motion and disturb the border fade.
         const MOTION_EPS: f32 = 0.5;
+
+        // Tiling-monitor bounds in screen coords. We use these to clip each
+        // window's rendered pixels so the strip never spills onto a
+        // neighbouring monitor. The monitor is assumed to start at (0, 0)
+        // — this matches `screen_size()` which returns the primary
+        // monitor's work area.
+        let monitor_width = self.screen_size.width();
+        let monitor_height = self.screen_size.height();
+
+        // Park coordinates for windows that are completely outside the
+        // tiling monitor. Chosen to be well outside any realistic
+        // virtual-screen layout.
+        const PARK_X: f32 = 100_000.0;
+        const PARK_Y: f32 = 100_000.0;
 
         let mut moved_any = false;
         for (window, x) in self.windows.iter_mut().zip(windows_positions) {
@@ -467,25 +601,100 @@ impl ScrollTiler {
             let target_height = self.padding.mul_add(-2.0, self.screen_size.height());
             let target_width = window.width;
 
+            // Screen-space intersection with the tiling monitor.
+            let vis_left = target_x.max(0.0);
+            let vis_top = target_y.max(0.0);
+            let vis_right = (target_x + target_width).min(monitor_width);
+            let vis_bottom = (target_y + target_height).min(monitor_height);
+            let fully_offscreen = vis_right <= vis_left || vis_bottom <= vis_top;
+            let fully_visible = target_x >= 0.0
+                && target_y >= 0.0
+                && target_x + target_width <= monitor_width
+                && target_y + target_height <= monitor_height;
+
+            // Decide where to physically place the window. Fully-off windows
+            // get parked at far coords so they don't render on any monitor.
+            let (place_x, place_y) = if fully_offscreen {
+                (PARK_X, PARK_Y)
+            } else {
+                (target_x, target_y)
+            };
+
             let changed = window
                 .last_layout
                 .map_or(true, |(px, py, pw, ph)| {
-                    (px - target_x).abs() > MOTION_EPS
-                        || (py - target_y).abs() > MOTION_EPS
+                    (px - place_x).abs() > MOTION_EPS
+                        || (py - place_y).abs() > MOTION_EPS
                         || (pw - target_width).abs() > MOTION_EPS
                         || (ph - target_height).abs() > MOTION_EPS
                 });
 
             if let Err(e) = window.inner.move_to(
-                [target_x, target_y].into(),
+                [place_x, place_y].into(),
                 [target_width, target_height].into(),
             ) {
                 warn!(
                     "Error while layouting window, skipping to next one (window might have been closed just after enumeration): {e}"
                 );
-            } else if changed {
+                continue;
+            }
+            if changed {
                 moved_any = true;
-                window.last_layout = Some((target_x, target_y, target_width, target_height));
+                window.last_layout = Some((place_x, place_y, target_width, target_height));
+            }
+
+            // Clip the rendered region so off-monitor pixels don't show up
+            // on a neighbouring screen. State changes are logged so any
+            // weirdness is easy to diagnose.
+            if fully_offscreen {
+                // Parked windows don't need a clip — they're already off
+                // every monitor. Make sure any prior clip is removed.
+                if window.last_clip.is_some() {
+                    if let Err(e) = window.inner.clear_visible_region() {
+                        warn!("clear_visible_region (park transition) failed: {e}");
+                    }
+                    log::debug!("clip: {:?} parked, cleared region", window.inner.handle());
+                    window.last_clip = None;
+                }
+            } else if fully_visible {
+                if window.last_clip.is_some() {
+                    if let Err(e) = window.inner.clear_visible_region() {
+                        warn!("clear_visible_region (fully-visible transition) failed: {e}");
+                    }
+                    log::debug!(
+                        "clip: {:?} fully visible, cleared region",
+                        window.inner.handle()
+                    );
+                    window.last_clip = None;
+                }
+            } else {
+                // Partial overflow — clip to the visible window-local rect.
+                #[allow(clippy::cast_possible_truncation)]
+                let local_left = (vis_left - target_x) as i32;
+                #[allow(clippy::cast_possible_truncation)]
+                let local_top = (vis_top - target_y) as i32;
+                #[allow(clippy::cast_possible_truncation)]
+                let local_right = (vis_right - target_x) as i32;
+                #[allow(clippy::cast_possible_truncation)]
+                let local_bottom = (vis_bottom - target_y) as i32;
+                let next_clip = (local_left, local_top, local_right, local_bottom);
+
+                if window.last_clip != Some(next_clip) {
+                    if let Err(e) = window.inner.set_visible_region(
+                        local_left,
+                        local_top,
+                        local_right,
+                        local_bottom,
+                    ) {
+                        warn!("set_visible_region failed: {e}");
+                    } else {
+                        log::debug!(
+                            "clip: {:?} partial -> ({local_left}, {local_top}, {local_right}, {local_bottom})",
+                            window.inner.handle()
+                        );
+                        window.last_clip = Some(next_clip);
+                    }
+                }
             }
         }
         if moved_any {

@@ -142,6 +142,27 @@ pub fn highlight_color() -> anyhow::Result<iced::Color> {
     Ok(iced::Color::from_rgb8(r, g, b))
 }
 
+/// Clear any `SetWindowRgn`-applied clipping regions on all visible top-
+/// level windows. We do this on startup (in case a previous winri was
+/// force-killed mid-clip) and on shutdown (so we don't strand any
+/// clipped windows after exit).
+pub fn clear_all_window_clips() {
+    let Ok(windows) = Window::enumerate() else {
+        return;
+    };
+    let mut cleared = 0usize;
+    for w in windows {
+        if window::filter::should_be_tiled(w).unwrap_or(false) {
+            if w.clear_visible_region().is_ok() {
+                cleared += 1;
+            }
+        }
+    }
+    if cleared > 0 {
+        log::info!("Cleared SetWindowRgn clipping on {cleared} window(s)");
+    }
+}
+
 /// Restore all tiled windows to a cascading position for user convenience.
 /// Typically called on application exit (nominal or error), so that windows are not lost off-screen.
 ///
@@ -149,6 +170,10 @@ pub fn highlight_color() -> anyhow::Result<iced::Color> {
 /// before any window falls past the bottom of the work area — the old +100
 /// step would slide ~14 windows diagonally off-screen on a normal display.
 pub fn restore_windows() {
+    // Belt-and-suspenders: any prior clip regions go away first so
+    // restored windows render their full contents.
+    clear_all_window_clips();
+
     let mut windows = Window::enumerate().unwrap_or_else(|e| {
         warn!("Could not enumerate windows to restore them: {e}");
         vec![]

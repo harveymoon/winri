@@ -1,5 +1,5 @@
 /// The root app module. It handle everything winri does.
-mod action;
+pub mod action;
 pub mod model;
 mod service;
 pub mod settings;
@@ -37,6 +37,11 @@ pub struct State {
     overlay_window_id: iced::window::Id,
     settings_window_id: Option<iced::window::Id>,
     settings_form: settings::SettingsForm,
+    /// True from launch until the first successful tiler update completes.
+    /// While set, the tiler snapshot ignores the monitor filter and pulls
+    /// every visible app window onto the tiling monitor — so a fresh session
+    /// always starts with a clean, consolidated tile strip.
+    pub(crate) pending_initial_consolidation: bool,
 }
 
 pub enum Mode {
@@ -82,6 +87,20 @@ pub enum Message {
     /// only a few pixels since mouse-down (i.e. a click, not a drag), the
     /// overview-mode handler will use this to jump to the clicked thumbnail.
     WindowMouseUp(iced::window::Id),
+
+    /// Right mouse button pressed in an iced window. Opens the overview
+    /// context menu when applicable.
+    WindowMouseRightDown(iced::window::Id),
+
+    /// Context-menu actions fired by the overview popup buttons.
+    OverviewIgnoreApp(String),
+    /// Session-only ignore — just this window's HWND falls out of the
+    /// tiler until restart. Other windows of the same app stay tiled.
+    OverviewIgnoreWindow(u64),
+    OverviewMoveToMonitor {
+        target: window::Window,
+        device_name: String,
+    },
 
     CleanupAndExit,
 }
@@ -147,6 +166,7 @@ impl State {
                 overlay_window_id,
                 settings_window_id: None,
                 settings_form: settings::SettingsForm::default(),
+                pending_initial_consolidation: true,
             },
             overlay_window_creation_task,
         )
@@ -214,6 +234,37 @@ impl State {
         }
     }
 
+    /// Persist the currently-focused window's class name to
+    /// `filter.ignored_classes`. Used by Win+I to silence transient
+    /// popups (e.g. TouchDesigner's Op Create Dialog) that auto-dismiss
+    /// on mouse-click, where the overview right-click flow can't reach
+    /// them. Class is preferred over title because popup titles change
+    /// or are blank, but the class is stable.
+    pub fn ignore_focused_window_by_class(&mut self) -> anyhow::Result<()> {
+        let focused = window::Window::focused().context("getting focused window")?;
+        let class = focused.class().context("reading focused window class")?;
+        let process = focused.process_name().unwrap_or_default();
+        let title = focused.title().ok().flatten().unwrap_or_default();
+
+        if class.is_empty() {
+            log::warn!("Ignore focused window: class empty, skipping");
+            return Ok(());
+        }
+
+        let mut cfg = config::current().clone();
+        let already = cfg.filter.ignored_classes.iter().any(|c| c == &class);
+        if !already {
+            cfg.filter.ignored_classes.push(class.clone());
+            config::save(cfg).context("saving config after Ignore focused window")?;
+            log::info!(
+                "Ignore focused window: added class {class:?} (process={process:?}, title={title:?})"
+            );
+        } else {
+            log::info!("Ignore focused window: class {class:?} already in ignored_classes");
+        }
+        Ok(())
+    }
+
     fn handle_api_command(&mut self, command: crate::api::ApiCommand) -> Task<Message> {
         use crate::api::{ApiCommand, NamedAction};
 
@@ -239,6 +290,17 @@ impl State {
                 Task::none()
             }
             ApiCommand::Action(named) => Task::done(Message::Action(named_action_to_action(named))),
+            ApiCommand::MoveToMonitor { hwnd, device_name } => {
+                if let Ok(target) = window::Window::from_safe_hwnd(hwnd) {
+                    if let Err(e) = self.overview_action_move_to_monitor(target, device_name) {
+                        log::warn!("API MoveToMonitor failed: {e:#}");
+                    }
+                    let _ = self.update_tiler();
+                } else {
+                    log::warn!("API MoveToMonitor: invalid HWND {hwnd}");
+                }
+                Task::none()
+            }
         }
     }
 }
@@ -322,20 +384,51 @@ impl State {
                 self.handle_overview_mouse_pressed(window_id);
             }
             Message::WindowMouseUp(window_id) => {
-                use crate::app::service::overview::ReleaseOutcome;
-                match self.overview_release_outcome(window_id) {
-                    Some(ReleaseOutcome::Click(target)) => {
-                        task = task.chain(Task::done(Message::Action(action::Action::Overview(
-                            action::OverviewAction::JumpTo(target),
-                        ))));
-                    }
-                    Some(ReleaseOutcome::Reorder { src, dst }) => {
-                        if let Err(e) = self.reorder_overview(src, dst) {
-                            log::warn!("Reorder failed: {e:#}");
+                // If a context menu is open, suppress the underlying
+                // click-to-jump and just dismiss the menu — except if the
+                // click was on a menu button (the button's on_press fired
+                // its own message already; we only need to ensure the
+                // menu closes, which the action handlers do).
+                if self.overview_context_menu_open() {
+                    self.dismiss_overview_context_menu();
+                } else {
+                    use crate::app::service::overview::ReleaseOutcome;
+                    match self.overview_release_outcome(window_id) {
+                        Some(ReleaseOutcome::Click(target)) => {
+                            task = task.chain(Task::done(Message::Action(
+                                action::Action::Overview(action::OverviewAction::JumpTo(target)),
+                            )));
                         }
+                        Some(ReleaseOutcome::Reorder { src, dst }) => {
+                            if let Err(e) = self.reorder_overview(src, dst) {
+                                log::warn!("Reorder failed: {e:#}");
+                            }
+                        }
+                        None => {}
                     }
-                    None => {}
                 }
+            }
+            Message::WindowMouseRightDown(window_id) => {
+                self.open_overview_context_menu(window_id);
+            }
+            Message::OverviewIgnoreApp(process) => {
+                if let Err(e) = self.overview_action_ignore_app(process) {
+                    log::warn!("Ignore-app action failed: {e:#}");
+                }
+                // Re-tile so the now-ignored app falls out.
+                let _ = self.update_tiler();
+            }
+            Message::OverviewIgnoreWindow(hwnd) => {
+                if let Err(e) = self.overview_action_ignore_window(hwnd) {
+                    log::warn!("Ignore-window action failed: {e:#}");
+                }
+                let _ = self.update_tiler();
+            }
+            Message::OverviewMoveToMonitor { target, device_name } => {
+                if let Err(e) = self.overview_action_move_to_monitor(target, device_name) {
+                    log::warn!("Move-to-monitor action failed: {e:#}");
+                }
+                let _ = self.update_tiler();
             }
         }
         if matches!(self.mode, Mode::Exit) {
@@ -373,10 +466,8 @@ impl State {
             view::overlay::view(self)
         } else if Some(window_id) == self.settings_window_id {
             settings::view(&self.settings_form)
-        } else if let Mode::Overview(state) = &self.mode
-            && state.overview_window_id == window_id
-        {
-            view::overview::view(state)
+        } else if let Some(monitor) = self.overview_monitor_for_window(window_id) {
+            view::overview::view(monitor)
         } else {
             view::empty()
         }
@@ -391,9 +482,7 @@ impl State {
                     ..Palette::DARK
                 },
             )
-        } else if Some(window_id) == self.overview_window_id() {
-            // Dimmed semi-transparent backdrop so thumbnails pop while
-            // letting the desktop bleed through faintly.
+        } else if self.overview_monitor_for_window(window_id).is_some() {
             iced::Theme::custom(
                 "Overview backdrop",
                 Palette {
@@ -402,7 +491,7 @@ impl State {
                 },
             )
         } else {
-            iced::Theme::Dark // TODO: Adapt to system theme
+            iced::Theme::Dark
         }
     }
 
@@ -441,6 +530,9 @@ fn on_event(
         }
         iced::Event::Mouse(MouseEvent::ButtonReleased(Button::Left)) => {
             Some(Message::WindowMouseUp(window_id))
+        }
+        iced::Event::Mouse(MouseEvent::ButtonPressed(Button::Right)) => {
+            Some(Message::WindowMouseRightDown(window_id))
         }
         _ => None,
     }

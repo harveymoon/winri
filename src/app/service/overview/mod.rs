@@ -1,18 +1,23 @@
-//! Overview mode — a single fullscreen window that shows live DWM thumbnails
-//! of all tiled windows. Click a thumbnail to jump to it; Win+↓ to exit.
+//! Overview mode — one fullscreen iced window *per monitor* that shows
+//! live DWM thumbnails of the windows located on that monitor.
 //!
-//! Architecture: one iced window (`overview_window_id`) is opened on entry
-//! and acts as the destination for N DWM thumbnail registrations — one per
-//! source window. Each thumbnail's `rcDestination` places it inside the
-//! overview window's client area. Mouse events are delivered to the overview
-//! window normally (no passthrough); clicks are hit-tested against the
-//! thumbnail rects to figure out which source window to jump to.
+//! Architecture: on `Win+↑`, winri enumerates monitors and opens one
+//! transparent topmost iced window over each. Every window emits its own
+//! `OverviewWindowCreated` message; for each one we partition all
+//! manageable top-level windows by `Window::monitor()` and register DWM
+//! thumbnails into the matching overview window. Mouse events (move,
+//! down, up) are delivered to whichever iced window the cursor is over —
+//! we look up the matching `MonitorOverview` by `window_id` and operate
+//! only on that subset.
+//!
+//! Cross-monitor drag-to-reorder is intentionally out of scope here;
+//! moving windows between monitors goes through the right-click context
+//! menu (Phase 4).
 
 mod thumbnail;
 
 use anyhow::Context;
 use iced::Task;
-use itertools::Itertools;
 
 use crate::{
     app::{self, Mode, service::overview::thumbnail::ThumbnailId},
@@ -22,33 +27,62 @@ use crate::{
 pub use thumbnail::ThumbnailRect;
 
 pub struct State {
-    /// The single fullscreen iced window hosting the overview.
-    pub overview_window_id: iced::window::Id,
-    /// All bound DWM thumbnails, in display order.
+    /// One entry per monitor in this session.
+    pub monitors: Vec<MonitorOverview>,
+}
+
+pub struct MonitorOverview {
+    pub window_id: iced::window::Id,
+    pub hmonitor: isize,
+    /// Monitor work-area origin in virtual-screen coords (can be negative
+    /// when secondary monitor is left of primary). Stored so we know where
+    /// to position the iced window when we open it.
+    pub origin: (f32, f32),
+    /// Monitor work-area size in pixels.
+    pub size: (f32, f32),
+    /// Live DWM thumbnails in display order for this monitor.
     pub thumbnails: Vec<Thumbnail>,
-    /// Last known cursor position inside the overview window (window coords).
-    /// Used to hit-test release events.
     pub cursor_pos: Option<iced::Point>,
-    /// Cursor position at the most recent left-mouse-down inside the overview
-    /// window. Cleared on mouse-up. If the cursor moved more than
-    /// `CLICK_DRAG_THRESHOLD_PX` between down and up, the gesture is treated
-    /// as a drag (currently a no-op; drag-reorder lands in a later phase).
     pub press_pos: Option<iced::Point>,
-    /// Index in `thumbnails` of the thumbnail under the cursor at mouse-down.
-    /// `None` if the press wasn't on any thumbnail. Used to identify the
-    /// drag source on the matching mouse-up.
     pub drag_source_idx: Option<usize>,
+    /// Active right-click menu, if any. Cleared on left-click anywhere or
+    /// after an action button is pressed.
+    pub context_menu: Option<ContextMenu>,
+}
+
+/// State for an open right-click menu in an overview. We compute the
+/// other-monitor list at open time so the view doesn't have to re-query
+/// `crate::monitor::enumerate()` every frame.
+#[derive(Debug, Clone)]
+pub struct ContextMenu {
+    /// Window the menu is acting on.
+    pub target: Window,
+    /// Anchor point in overview-window-local coords (where the right-click
+    /// landed). The view positions the popup at this point.
+    pub anchor: iced::Point,
+    /// Display name of the source app (e.g. "Chrome"). Used for the
+    /// "Ignore <app>" button label.
+    pub app_name: String,
+    /// `.exe` filename — what gets written to `ignored_processes` if the
+    /// user picks "Ignore app".
+    pub process: String,
+    /// Monitors other than the one this menu is on, sorted by index.
+    /// Each tuple is `(device_name, friendly_label)`.
+    pub other_monitors: Vec<(String, String)>,
+}
+
+impl MonitorOverview {
+    fn thumbnail_at(&self, pos: iced::Point) -> Option<usize> {
+        self.thumbnails.iter().position(|t| {
+            t.rect.contains(f64::from(pos.x), f64::from(pos.y))
+        })
+    }
 }
 
 /// Maximum pixel distance the cursor may move between mouse-down and mouse-up
 /// to still count as a click rather than a drag.
 pub const CLICK_DRAG_THRESHOLD_PX: f32 = 5.0;
 
-/// Turn a process executable name like "chrome.exe" into a display name
-/// like "Chrome" for the overview label. We strip the `.exe` suffix and
-/// capitalize the first character; CamelCase names are left intact
-/// ("WindowsTerminal.exe" → "WindowsTerminal") since splitting them
-/// reliably is more trouble than it's worth.
 fn process_name_to_app_name(process_name: &str) -> String {
     let stem = process_name
         .strip_suffix(".exe")
@@ -56,20 +90,18 @@ fn process_name_to_app_name(process_name: &str) -> String {
         .unwrap_or(process_name);
     let mut chars = stem.chars();
     match chars.next() {
-        Some(first) => first
-            .to_uppercase()
-            .chain(chars)
-            .collect::<String>(),
+        Some(first) => first.to_uppercase().chain(chars).collect::<String>(),
         None => stem.to_owned(),
     }
 }
 
-/// Outcome of a left-mouse-up over the overview window.
+/// Outcome of a left-mouse-up over an overview window.
 #[derive(Debug, Clone, Copy)]
 pub enum ReleaseOutcome {
     /// User clicked on this source window — jump to it.
     Click(Window),
-    /// User dragged `src` onto `dst` — reorder so `src` takes `dst`'s slot.
+    /// User dragged `src` onto `dst` within the same monitor — reorder so
+    /// `src` takes `dst`'s slot.
     Reorder { src: Window, dst: Window },
 }
 
@@ -77,22 +109,22 @@ pub struct Thumbnail {
     pub thumbnail_id: ThumbnailId,
     pub src: Window,
     pub rect: ThumbnailRect,
-    /// Display name of the owning app, derived from the .exe name
-    /// (e.g. "chrome.exe" → "Chrome"). Cached at overview entry.
     pub app_name: String,
-    /// The source window's title at the time overview opened. Cached because
-    /// `Window::title` is a Win32 round-trip we don't want to do on every
-    /// canvas redraw.
     pub title: String,
+    /// App icon as a ready-to-draw iced image handle, if available.
+    /// `None` when the window doesn't expose an icon (e.g. some UWP host
+    /// windows). Built once at overview entry.
+    pub icon: Option<(u32, u32, iced::widget::image::Handle)>,
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    /// Fired once the single overview window is created and we have its raw
-    /// HWND. We register thumbnails and switch to overview mode in response.
+    /// Fired once a per-monitor overview window is created and we have its
+    /// raw HWND. We register that monitor's thumbnails in response.
     OverviewWindowCreated {
         id: iced::window::Id,
         raw_handle: u64,
+        hmonitor: isize,
     },
 }
 
@@ -106,21 +138,31 @@ impl app::State {
             return Task::none();
         }
 
-        if self.tiler.windows().next().is_none() {
-            // Nothing to show — just no-op.
+        let monitors = crate::monitor::enumerate();
+        if monitors.is_empty() {
             return Task::none();
         }
 
-        thumbnail::open_overview_window(self.tiler.screen_size())
+        // One window-creation task per monitor, batched together.
+        Task::batch(monitors.into_iter().map(|m| {
+            #[allow(clippy::cast_precision_loss)]
+            let origin = (m.work_area.left as f32, m.work_area.top as f32);
+            #[allow(clippy::cast_precision_loss)]
+            let size = (m.work_area_width() as f32, m.work_area_height() as f32);
+            thumbnail::open_overview_window(m.hmonitor, origin, size)
+        }))
     }
 
     pub fn handle_overview_message(&mut self, message: Message) -> anyhow::Result<()> {
         match message {
-            Message::OverviewWindowCreated { id, raw_handle } => {
-                self.finalize_open_overview(id, raw_handle)?;
+            Message::OverviewWindowCreated {
+                id,
+                raw_handle,
+                hmonitor,
+            } => {
+                self.finalize_open_overview(id, raw_handle, hmonitor)?;
             }
         }
-
         Ok(())
     }
 
@@ -128,36 +170,114 @@ impl app::State {
         &mut self,
         overview_window_id: iced::window::Id,
         raw_handle: u64,
+        hmonitor: isize,
     ) -> anyhow::Result<()> {
-        let windows: Vec<thumbnail::WindowData> = self
-            .tiler
-            .windows()
-            .map(|item| thumbnail::WindowData {
-                inner: item.inner,
-                width: item.width,
-            })
-            .collect_vec();
+        // First overview window creation also flips us into Overview mode
+        // and moves the tiled source windows offscreen.
+        if !matches!(self.mode, Mode::Overview(_)) {
+            for tiled_window in self.tiler.windows() {
+                if let Err(e) = tiled_window.inner.move_offscreen() {
+                    log::warn!("Failed to move source window offscreen: {e:#}");
+                }
+            }
+            log::info!("switching to Overview mode (per-monitor)");
+            self.mode = Mode::Overview(State {
+                monitors: Vec::new(),
+            });
+        }
 
-        let layouts = thumbnail::compute_thumbnail_layouts(
-            &windows,
-            self.tiler.screen_size(),
-            10.0,
-        );
+        // Find the matching `Monitor` so we can read its work area and
+        // figure out which top-level windows live on it.
+        let monitor_info = crate::monitor::enumerate()
+            .into_iter()
+            .find(|m| m.hmonitor == hmonitor)
+            .with_context(|| format!("monitor {hmonitor} disappeared during overview open"))?;
 
-        // Move all source windows offscreen so they don't compete with their
-        // own thumbnails.
-        for window in &windows {
-            if let Err(e) = window.inner.move_offscreen() {
-                log::warn!("Failed to move source window offscreen: {e:#}");
+        // Decide which windows belong in this monitor's overview.
+        //
+        // Tiled windows are placed by the tiler at strip-positions that can
+        // physically straddle monitor edges (especially when the strip is
+        // wider than the primary monitor). Their *logical* home is the
+        // tiling monitor regardless of where their pixels currently land,
+        // so we route ALL tiled windows into the tiling monitor's overview.
+        //
+        // Free-floating (non-tiled) windows are placed wherever the user
+        // dragged them; we partition those by their actual current monitor.
+        let tiling_hmonitor_now = self.tiling_hmonitor();
+        let mut on_this_monitor: Vec<Window> = Vec::new();
+        if hmonitor == tiling_hmonitor_now {
+            for item in self.tiler.windows() {
+                on_this_monitor.push(item.inner);
             }
         }
+        if let Ok(all_filtered) = crate::window::filter::all_managed_windows() {
+            let tiled: std::collections::HashSet<Window> =
+                self.tiler.windows().map(|i| i.inner).collect();
+            for w in all_filtered {
+                if tiled.contains(&w) {
+                    continue;
+                }
+                if w.monitor() == hmonitor {
+                    on_this_monitor.push(w);
+                }
+            }
+        }
+
+        // Layout uses tiler-known dimensions if the window is tiled,
+        // otherwise the window's actual on-screen size. The grid layout
+        // uses both width and height to preserve aspect ratio; the strip
+        // layout only consults width and uses a fixed height.
+        let tile_height = self
+            .tiler
+            .screen_size()
+            .height()
+            .mul_add(1.0, -2.0 * 10.0); // approximate strip thumb height
+        let window_data: Vec<thumbnail::WindowData> = on_this_monitor
+            .iter()
+            .map(|w| {
+                if let Some(item) = self.tiler.windows().find(|item| item.inner == *w) {
+                    return thumbnail::WindowData {
+                        inner: *w,
+                        width: item.width,
+                        height: tile_height,
+                    };
+                }
+                if let Ok(bounds) = w.desktop_manager_bounds() {
+                    return thumbnail::WindowData {
+                        inner: *w,
+                        width: bounds.size().width(),
+                        height: bounds.size().height(),
+                    };
+                }
+                thumbnail::WindowData {
+                    inner: *w,
+                    width: 800.0,
+                    height: 600.0,
+                }
+            })
+            .collect();
+
+        #[allow(clippy::cast_precision_loss)]
+        let monitor_size = crate::utils::math::Size([
+            monitor_info.work_area_width() as f32,
+            monitor_info.work_area_height() as f32,
+        ]);
+        // Tiling monitor keeps the horizontal-strip overview (preserves
+        // drag-reorder semantics). Floating monitors get a wrapping grid
+        // that adapts to the monitor's aspect ratio.
+        let is_tiling_monitor = hmonitor == self.tiling_hmonitor();
+        let layouts = if is_tiling_monitor {
+            thumbnail::compute_thumbnail_layouts(&window_data, monitor_size, 10.0)
+        } else {
+            thumbnail::compute_grid_layout(&window_data, monitor_size, 16.0)
+        };
 
         let dest_window = Window::from_safe_hwnd(raw_handle)
             .context(raw_handle)
             .context("invalid hwnd from overview window")?;
 
         let mut thumbnails = Vec::new();
-        for (window, layout) in windows.iter().zip(layouts.into_iter()) {
+        for (window, layout) in window_data.iter().zip(layouts.into_iter()) {
             match thumbnail::register_thumbnail(window.inner, dest_window, layout.rect) {
                 Ok(thumbnail_id) => {
                     let title = window
@@ -171,12 +291,23 @@ impl app::State {
                         .process_name()
                         .ok()
                         .map_or_else(String::new, |p| process_name_to_app_name(&p));
+
+                    // Best-effort app-icon fetch. None is fine — the view
+                    // simply omits the icon and falls back to text-only.
+                    let icon = crate::icon::fetch_icon_rgba(window.inner.handle().0 as u64)
+                        .map(|(w, h, rgba)| {
+                            let handle =
+                                iced::widget::image::Handle::from_rgba(w, h, rgba);
+                            (w, h, handle)
+                        });
+
                     thumbnails.push(Thumbnail {
                         thumbnail_id,
                         src: window.inner,
                         rect: layout.rect,
                         app_name,
                         title,
+                        icon,
                     });
                 }
                 Err(e) => {
@@ -185,23 +316,36 @@ impl app::State {
             }
         }
 
-        // Enter Overview mode even if some Win32 calls below misbehave —
-        // otherwise the user can get stuck unable to exit overview.
         log::info!(
-            "switching to Overview mode ({} thumbnails bound)",
-            thumbnails.len()
+            "monitor {} ({}): bound {} thumbnails",
+            monitor_info.device_name,
+            if monitor_info.is_primary { "primary" } else { "secondary" },
+            thumbnails.len(),
         );
-        self.mode = Mode::Overview(State {
-            overview_window_id,
+
+        let Mode::Overview(state) = &mut self.mode else {
+            unreachable!("set above");
+        };
+        #[allow(clippy::cast_precision_loss)]
+        state.monitors.push(MonitorOverview {
+            window_id: overview_window_id,
+            hmonitor,
+            origin: (
+                monitor_info.work_area.left as f32,
+                monitor_info.work_area.top as f32,
+            ),
+            size: (
+                monitor_info.work_area_width() as f32,
+                monitor_info.work_area_height() as f32,
+            ),
             thumbnails,
             cursor_pos: None,
             press_pos: None,
             drag_source_idx: None,
+            context_menu: None,
         });
 
-        // Let API clients see the mode flip immediately.
         self.publish_api_snapshot();
-
         Ok(())
     }
 
@@ -214,76 +358,69 @@ impl app::State {
             return Ok(Task::none());
         };
 
-        // Best-effort unbind — log and continue on error so a single bad
-        // thumbnail can't strand the others.
-        for thumb in &state.thumbnails {
-            if let Err(e) = thumbnail::unbind_thumbnail(thumb.thumbnail_id) {
-                log::warn!("Failed to unbind thumbnail: {e:#}");
+        let mut close_tasks: Vec<Task<app::Message>> = Vec::new();
+        for monitor in &state.monitors {
+            for thumb in &monitor.thumbnails {
+                if let Err(e) = thumbnail::unbind_thumbnail(thumb.thumbnail_id) {
+                    log::warn!("Failed to unbind thumbnail: {e:#}");
+                }
             }
+            close_tasks.push(iced::window::close::<app::Message>(monitor.window_id));
         }
-        let close_task = iced::window::close::<app::Message>(state.overview_window_id);
 
         self.switch_to_tiler_mode()?;
-
-        Ok(close_task)
+        Ok(Task::batch(close_tasks))
     }
 
-    /// Returns the iced window id of the overview window, if currently in
-    /// overview mode. Used by view/event dispatch to detect "are we in the
-    /// overview window?".
-    pub fn overview_window_id(&self) -> Option<iced::window::Id> {
+    /// Whether the given iced window id belongs to one of our overview
+    /// windows. Used by view/theme/event dispatch.
+    pub fn overview_monitor_for_window(
+        &self,
+        window_id: iced::window::Id,
+    ) -> Option<&MonitorOverview> {
         if let Mode::Overview(state) = &self.mode {
-            Some(state.overview_window_id)
+            state.monitors.iter().find(|m| m.window_id == window_id)
         } else {
             None
         }
     }
 
-    /// Stash the latest cursor position from iced so the next click can be
-    /// hit-tested against the thumbnail layout.
+    fn overview_monitor_for_window_mut(
+        &mut self,
+        window_id: iced::window::Id,
+    ) -> Option<&mut MonitorOverview> {
+        if let Mode::Overview(state) = &mut self.mode {
+            state.monitors.iter_mut().find(|m| m.window_id == window_id)
+        } else {
+            None
+        }
+    }
+
     pub fn handle_overview_cursor_moved(
         &mut self,
         window_id: iced::window::Id,
         pos: iced::Point,
     ) {
-        if let Mode::Overview(state) = &mut self.mode
-            && state.overview_window_id == window_id
-        {
-            state.cursor_pos = Some(pos);
+        if let Some(monitor) = self.overview_monitor_for_window_mut(window_id) {
+            monitor.cursor_pos = Some(pos);
         }
     }
 
-    /// Record the cursor position at the start of a left-mouse-down on the
-    /// overview window so the next mouse-up can decide click vs drag, and
-    /// remember which thumbnail (if any) was under the cursor for drag-reorder.
     pub fn handle_overview_mouse_pressed(&mut self, window_id: iced::window::Id) {
-        if let Mode::Overview(state) = &mut self.mode
-            && state.overview_window_id == window_id
-        {
-            state.press_pos = state.cursor_pos;
-            state.drag_source_idx = state.cursor_pos.and_then(|pos| {
-                state.thumbnails.iter().position(|t| {
-                    t.rect.contains(f64::from(pos.x), f64::from(pos.y))
-                })
-            });
+        if let Some(monitor) = self.overview_monitor_for_window_mut(window_id) {
+            monitor.press_pos = monitor.cursor_pos;
+            monitor.drag_source_idx = monitor.cursor_pos.and_then(|p| monitor.thumbnail_at(p));
         }
     }
 
-    /// Decide what happened on left-mouse-up over the overview window.
-    /// Always clears the press/drag-source markers.
     pub fn overview_release_outcome(
         &mut self,
         window_id: iced::window::Id,
     ) -> Option<ReleaseOutcome> {
-        let Mode::Overview(state) = &mut self.mode else {
-            return None;
-        };
-        if state.overview_window_id != window_id {
-            return None;
-        }
-        let press = state.press_pos.take();
-        let drag_source_idx = state.drag_source_idx.take();
-        let current = state.cursor_pos?;
+        let monitor = self.overview_monitor_for_window_mut(window_id)?;
+        let press = monitor.press_pos.take();
+        let drag_source_idx = monitor.drag_source_idx.take();
+        let current = monitor.cursor_pos?;
         let press = press?;
 
         let dx = current.x - press.x;
@@ -291,54 +428,214 @@ impl app::State {
         let distance = (dx * dx + dy * dy).sqrt();
 
         if distance <= CLICK_DRAG_THRESHOLD_PX {
-            // Click: jump to the thumbnail under the cursor.
-            return state
-                .thumbnails
-                .iter()
-                .find(|t| {
-                    t.rect
-                        .contains(f64::from(current.x), f64::from(current.y))
-                })
-                .map(|t| ReleaseOutcome::Click(t.src));
+            return monitor
+                .thumbnail_at(current)
+                .map(|i| ReleaseOutcome::Click(monitor.thumbnails[i].src));
         }
 
-        // Drag: reorder if the cursor was on a thumbnail at both ends.
+        // Drag: only intra-monitor reorder. Cross-monitor moves go through
+        // the context menu (Phase 4).
         let src_idx = drag_source_idx?;
-        let dst_idx = state.thumbnails.iter().position(|t| {
-            t.rect
-                .contains(f64::from(current.x), f64::from(current.y))
-        })?;
+        let dst_idx = monitor.thumbnail_at(current)?;
         if src_idx == dst_idx {
             return None;
         }
         Some(ReleaseOutcome::Reorder {
-            src: state.thumbnails[src_idx].src,
-            dst: state.thumbnails[dst_idx].src,
+            src: monitor.thumbnails[src_idx].src,
+            dst: monitor.thumbnails[dst_idx].src,
         })
     }
 
-    /// Reorder the tiler so `src` takes `dst`'s slot, then refresh DWM
-    /// thumbnail rects in-place so the overview UI matches.
+    /// Right-click in an overview: hit-test the cursor against thumbnails;
+    /// if there's a hit, open a context menu anchored at the cursor.
+    pub fn open_overview_context_menu(&mut self, window_id: iced::window::Id) {
+        let monitors = crate::monitor::enumerate();
+        let Some(monitor_overview) = self.overview_monitor_for_window_mut(window_id) else {
+            return;
+        };
+        let Some(cursor) = monitor_overview.cursor_pos else {
+            return;
+        };
+        let Some(thumb_idx) = monitor_overview
+            .thumbnails
+            .iter()
+            .position(|t| t.rect.contains(f64::from(cursor.x), f64::from(cursor.y)))
+        else {
+            // Right-click on empty space dismisses any open menu.
+            monitor_overview.context_menu = None;
+            return;
+        };
+
+        let thumb = &monitor_overview.thumbnails[thumb_idx];
+        let target = thumb.src;
+        let app_name = thumb.app_name.clone();
+        let process = target.process_name().unwrap_or_default();
+        let our_hmonitor = monitor_overview.hmonitor;
+
+        // Anchor the menu just below the thumbnail's bottom edge. DWM
+        // composites thumbnails on top of anything iced renders inside
+        // their rect, so the popup has to live outside that rect to stay
+        // visible.
+        #[allow(clippy::cast_possible_truncation)]
+        let anchor = iced::Point::new(
+            thumb.rect.x as f32,
+            (thumb.rect.y + thumb.rect.height) as f32 + 4.0,
+        );
+
+        let other_monitors: Vec<(String, String)> = monitors
+            .iter()
+            .filter(|m| m.hmonitor != our_hmonitor)
+            .enumerate()
+            .map(|(i, m)| {
+                let label = if m.is_primary {
+                    format!("Move to primary monitor")
+                } else {
+                    format!("Move to monitor {}", i + 2)
+                };
+                (m.device_name.clone(), label)
+            })
+            .collect();
+
+        let _ = cursor; // Cursor used for hit-test only; menu anchors to thumbnail.
+        monitor_overview.context_menu = Some(ContextMenu {
+            target,
+            anchor,
+            app_name,
+            process,
+            other_monitors,
+        });
+    }
+
+    /// Dismiss any open context menu. Called on left-click anywhere or after
+    /// an action button is pressed.
+    pub fn dismiss_overview_context_menu(&mut self) {
+        if let Mode::Overview(state) = &mut self.mode {
+            for monitor in &mut state.monitors {
+                monitor.context_menu = None;
+            }
+        }
+    }
+
+    /// Whether any monitor's overview currently has a context menu open.
+    pub fn overview_context_menu_open(&self) -> bool {
+        if let Mode::Overview(state) = &self.mode {
+            state.monitors.iter().any(|m| m.context_menu.is_some())
+        } else {
+            false
+        }
+    }
+
+    /// "Ignore app" action from the context menu — adds the process name
+    /// to `ignored_processes` in the persisted config and forces a tiler
+    /// refresh so the app falls out immediately.
+    pub fn overview_action_ignore_app(&mut self, process: String) -> anyhow::Result<()> {
+        if process.is_empty() {
+            return Ok(());
+        }
+        let mut cfg = crate::config::current().clone();
+        if !cfg.filter.ignored_processes.iter().any(|p| p == &process) {
+            cfg.filter.ignored_processes.push(process.clone());
+            crate::config::save(cfg)
+                .context("saving config after Ignore app from overview menu")?;
+            log::info!("Overview menu: ignoring app {process}");
+        }
+        self.dismiss_overview_context_menu();
+        Ok(())
+    }
+
+    /// "Ignore this window" action — adds a (process, title) tuple to the
+    /// persisted `ignored_window_titles` so this specific window stays out
+    /// of the tiler across restarts. Useful for popup/settings dialogs
+    /// that an app reuses with a stable title.
+    pub fn overview_action_ignore_window(&mut self, hwnd_raw: u64) -> anyhow::Result<()> {
+        let target = crate::window::Window::from_safe_hwnd(hwnd_raw)
+            .context("invalid HWND for Ignore window")?;
+        let process = target.process_name().unwrap_or_default();
+        let title = target.title().ok().flatten().unwrap_or_default();
+        if process.is_empty() || title.is_empty() {
+            log::warn!(
+                "Ignore window: missing process={process:?} or title={title:?}; skipping persist"
+            );
+            self.dismiss_overview_context_menu();
+            return Ok(());
+        }
+
+        let mut cfg = crate::config::current().clone();
+        let already = cfg
+            .filter
+            .ignored_window_titles
+            .iter()
+            .any(|e| e.process == process && e.title == title);
+        if !already {
+            cfg.filter
+                .ignored_window_titles
+                .push(crate::config::IgnoredWindowTitle {
+                    process: process.clone(),
+                    title: title.clone(),
+                });
+            crate::config::save(cfg)
+                .context("saving config after Ignore window from overview menu")?;
+            log::info!("Overview menu: ignoring window process={process} title={title:?}");
+        }
+        self.dismiss_overview_context_menu();
+        Ok(())
+    }
+
+    /// "Move to monitor" action — centers the target window in the named
+    /// monitor's work area. If the destination is the tiling monitor and the
+    /// window isn't already tiled, the next snapshot picks it up; if the
+    /// destination is a floating monitor and the window is tiled, the next
+    /// drag-end / monitor-mismatch check untiles it.
+    pub fn overview_action_move_to_monitor(
+        &mut self,
+        target: crate::window::Window,
+        device_name: String,
+    ) -> anyhow::Result<()> {
+        let monitor = crate::monitor::find_by_device_name(&device_name)
+            .with_context(|| format!("monitor `{device_name}` not attached"))?;
+        target
+            .move_to_monitor(&monitor)
+            .context("moving window to selected monitor")?;
+        log::info!(
+            "Overview menu: moved {:?} to {}",
+            target.handle(),
+            monitor.device_name
+        );
+        self.dismiss_overview_context_menu();
+        Ok(())
+    }
+
     pub fn reorder_overview(&mut self, src: Window, dst: Window) -> anyhow::Result<()> {
         self.tiler.reorder(src, dst);
 
-        // Recompute layouts in the new order.
+        // Only the tiling monitor's thumbnails reflect the tiler's order;
+        // recompute that monitor's layout in-place.
+        let strip_height = self.tiler.screen_size().height();
         let windows: Vec<thumbnail::WindowData> = self
             .tiler
             .windows()
             .map(|item| thumbnail::WindowData {
                 inner: item.inner,
                 width: item.width,
+                height: strip_height,
             })
             .collect();
         let layouts =
             thumbnail::compute_thumbnail_layouts(&windows, self.tiler.screen_size(), 10.0);
 
+        let tiling_hmonitor = self.tiling_hmonitor();
         let Mode::Overview(state) = &mut self.mode else {
             return Ok(());
         };
+        let Some(monitor) = state
+            .monitors
+            .iter_mut()
+            .find(|m| m.hmonitor == tiling_hmonitor)
+        else {
+            return Ok(());
+        };
 
-        for thumb in &mut state.thumbnails {
+        for thumb in &mut monitor.thumbnails {
             let Some(idx) = windows.iter().position(|w| w.inner == thumb.src) else {
                 continue;
             };

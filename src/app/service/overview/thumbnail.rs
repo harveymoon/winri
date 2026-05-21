@@ -40,10 +40,96 @@ impl ThumbnailRect {
 pub struct WindowData {
     pub inner: Window,
     pub width: f32,
+    /// Source-window height — used by the grid layout to preserve aspect
+    /// ratio. Strip layout ignores it (all strip thumbnails use the same
+    /// height derived from the monitor).
+    pub height: f32,
 }
 
 pub struct ThumbnailLayout {
     pub rect: ThumbnailRect,
+}
+
+/// Lay out thumbnails as a wrapping grid — used on monitors that aren't
+/// the tile strip's host. Cells are sized so that thumbnails roughly
+/// preserve the source-window aspect ratios, distributed across rows
+/// chosen to suit the monitor's own aspect (so a portrait secondary
+/// monitor packs them vertically). A blank strip below each thumbnail is
+/// reserved so the existing label renderer has somewhere to draw the
+/// title + app name.
+pub fn compute_grid_layout(
+    windows: &[WindowData],
+    monitor_size: Size,
+    padding: f32,
+) -> Vec<ThumbnailLayout> {
+    /// Space reserved below each thumbnail for the two-line label.
+    const LABEL_RESERVE: f32 = 44.0;
+
+    let n = windows.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    let mw = monitor_size.width();
+    let mh = monitor_size.height();
+    #[allow(clippy::cast_precision_loss)]
+    let n_f = n as f32;
+
+    // Pick a column count that roughly matches the monitor aspect ratio.
+    // For a 1.78 landscape with 12 windows: cols ≈ ceil(sqrt(12 * 1.78)) ≈ 5.
+    // For a 0.56 portrait with 12 windows: cols ≈ ceil(sqrt(12 * 0.56)) ≈ 3.
+    let aspect = (mw / mh).max(0.01);
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    let cols = ((n_f * aspect).sqrt().ceil() as usize).max(1).min(n);
+    let rows = n.div_ceil(cols);
+
+    #[allow(clippy::cast_precision_loss)]
+    let cell_w = ((mw - padding) / (cols as f32)) - padding;
+    #[allow(clippy::cast_precision_loss)]
+    let cell_h = ((mh - padding) / (rows as f32)) - padding;
+    let thumb_w = cell_w.max(10.0);
+    let thumb_h = (cell_h - LABEL_RESERVE).max(10.0);
+
+    let mut layouts = Vec::with_capacity(n);
+    for (i, window) in windows.iter().enumerate() {
+        #[allow(clippy::cast_precision_loss)]
+        let col = (i % cols) as f32;
+        #[allow(clippy::cast_precision_loss)]
+        let row = (i / cols) as f32;
+        let cell_x = padding + col * (cell_w + padding);
+        let cell_y = padding + row * (cell_h + padding);
+
+        // Preserve the source-window aspect ratio: fit the thumbnail inside
+        // (thumb_w × thumb_h) and centre it within the cell. Without this,
+        // DWM stretches the source to whatever rect we hand it, producing
+        // squished thumbnails on portrait/landscape mismatch.
+        let src_w = window.width.max(1.0);
+        let src_h = window.height.max(1.0);
+        let cell_aspect = thumb_w / thumb_h.max(0.01);
+        let src_aspect = src_w / src_h;
+        let (fit_w, fit_h) = if src_aspect > cell_aspect {
+            // Source is wider than the cell — fit by width.
+            (thumb_w, thumb_w / src_aspect)
+        } else {
+            (thumb_h * src_aspect, thumb_h)
+        };
+        let offset_x = (thumb_w - fit_w) / 2.0;
+        let offset_y = (thumb_h - fit_h) / 2.0;
+
+        layouts.push(ThumbnailLayout {
+            rect: ThumbnailRect {
+                x: f64::from(cell_x + offset_x),
+                y: f64::from(cell_y + offset_y),
+                width: f64::from(fit_w),
+                height: f64::from(fit_h),
+            },
+        });
+    }
+    layouts
 }
 
 /// Lay out thumbnails as a centered horizontal strip, scaled down from the
@@ -95,19 +181,19 @@ pub fn compute_thumbnail_layouts(
     layouts
 }
 
-/// Open the single fullscreen overview window. On creation, emits an
-/// `OverviewWindowCreated` message carrying the iced id and raw HWND so the
-/// caller can bind DWM thumbnails into it.
-///
-/// We rely on iced's own visibility/level handling rather than calling Win32
-/// `ShowWindow` ourselves — that flow has been flaky on iced-managed windows
-/// in this fork (intermittent "system cannot find the file" errors).
-pub fn open_overview_window(screen_size: Size) -> Task<app::Message> {
+/// Open one fullscreen overview window at a specific monitor's work area.
+/// On creation, emits an `OverviewWindowCreated` message tagged with the
+/// `hmonitor` so the caller can register the right windows' thumbnails.
+pub fn open_overview_window(
+    hmonitor: isize,
+    origin: (f32, f32),
+    size: (f32, f32),
+) -> Task<app::Message> {
     let (id, window_creation) = iced::window::open(Settings {
         decorations: false,
         transparent: true,
-        size: screen_size.into(),
-        position: iced::window::Position::Specific(iced::Point::ORIGIN),
+        size: iced::Size::new(size.0, size.1),
+        position: iced::window::Position::Specific(iced::Point::new(origin.0, origin.1)),
         resizable: false,
         visible: true,
         level: iced::window::Level::AlwaysOnTop,
@@ -123,7 +209,11 @@ pub fn open_overview_window(screen_size: Size) -> Task<app::Message> {
         .then(move |_| iced::window::raw_id::<app::Message>(id))
         .then(move |raw_handle| {
             Task::done(app::Message::Overview(
-                overview::Message::OverviewWindowCreated { id, raw_handle },
+                overview::Message::OverviewWindowCreated {
+                    id,
+                    raw_handle,
+                    hmonitor,
+                },
             ))
         })
 }

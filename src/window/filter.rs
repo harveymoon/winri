@@ -52,6 +52,19 @@ pub fn should_be_tiled(window: Window) -> anyhow::Result<bool> {
     let user_cfg = config::current();
     filter_out_if!(user_cfg.filter.ignored_classes.iter().any(|c| c == &class));
     filter_out_if!(user_cfg.filter.ignored_processes.iter().any(|p| p == &process));
+    // Per-window persistent ignore: process + exact title match.
+    let title_str = window
+        .title()
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    filter_out_if!(
+        user_cfg
+            .filter
+            .ignored_window_titles
+            .iter()
+            .any(|e| e.process == process && e.title == title_str)
+    );
     drop(user_cfg);
 
     filter_out_if!(!window.is_valid()?);
@@ -59,6 +72,11 @@ pub fn should_be_tiled(window: Window) -> anyhow::Result<bool> {
     Ok(true)
 }
 
+/// Enumerate all top-level windows that pass the standard "should be
+/// managed" filter. The result is *not* gated by monitor — that decision
+/// is made by [`crate::scroll_tiler::ScrollTiler`] when deciding whether
+/// to add a new window or to untile an existing one (see the drag-end
+/// detection there).
 pub fn opened_windows() -> anyhow::Result<HashSet<Window>> {
     let windows = Window::enumerate()?
         .into_iter()
@@ -66,4 +84,14 @@ pub fn opened_windows() -> anyhow::Result<HashSet<Window>> {
         .collect::<HashSet<_>>();
 
     Ok(windows)
+}
+
+/// All visible top-level windows that pass the standard filter, regardless
+/// of which monitor they're on. Used by the overview so floating windows on
+/// secondary monitors also get thumbnails.
+pub fn all_managed_windows() -> anyhow::Result<Vec<Window>> {
+    Ok(Window::enumerate()?
+        .into_iter()
+        .filter(|window| should_be_tiled(*window).unwrap_or(false))
+        .collect())
 }

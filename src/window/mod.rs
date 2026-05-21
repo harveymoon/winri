@@ -98,6 +98,13 @@ impl Window {
             && wincall_into_result!(IsWindow(Some(self.handle())))?.as_bool())
     }
 
+    /// Returns the `HMONITOR` of the monitor containing this window (or
+    /// the nearest, if it straddles edges). Stored as `isize` so the value
+    /// is comparable across threads. Cheap (~microseconds).
+    pub fn monitor(self) -> isize {
+        crate::monitor::monitor_of_hwnd(self.handle())
+    }
+
     pub fn enumerate() -> anyhow::Result<Vec<Self>> {
         unsafe extern "system" fn enum_callback(window: HWND, out_list: LPARAM) -> BOOL {
             let list = unsafe { &mut *(out_list.0 as *mut Vec<Window>) };
@@ -291,6 +298,65 @@ impl Window {
             LPARAM::default()
         ))?;
         Ok(())
+    }
+
+    /// Apply a rectangular clipping region to the window in window-relative
+    /// coordinates. Pixels outside this rect are not rendered, but the
+    /// window keeps its full size from the app's perspective. Use to keep
+    /// the tile strip visually contained within one monitor without
+    /// resizing windows.
+    ///
+    /// Calls `SetWindowRgn`; ownership of the GDI region handle transfers
+    /// to the OS, so we do not delete it ourselves.
+    pub fn set_visible_region(
+        self,
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    ) -> anyhow::Result<()> {
+        ensure_valid!(self);
+        use windows::Win32::Graphics::Gdi::{CreateRectRgn, SetWindowRgn};
+        let hrgn = unsafe { CreateRectRgn(left, top, right, bottom) };
+        if hrgn.is_invalid() {
+            return Err(anyhow::anyhow!("CreateRectRgn returned NULL"));
+        }
+        let _ = unsafe { SetWindowRgn(self.handle(), Some(hrgn), true) };
+        Ok(())
+    }
+
+    /// Clear any previously-applied clipping region — the whole window is
+    /// rendered again.
+    pub fn clear_visible_region(self) -> anyhow::Result<()> {
+        ensure_valid!(self);
+        use windows::Win32::Graphics::Gdi::SetWindowRgn;
+        let _ = unsafe { SetWindowRgn(self.handle(), None, true) };
+        Ok(())
+    }
+
+    /// Move the window so it's centered in the given monitor's work area
+    /// at a comfortable default size (~80% of the work area). Used by the
+    /// overview context menu's "Move to monitor N".
+    pub fn move_to_monitor(self, monitor: &crate::monitor::Monitor) -> anyhow::Result<()> {
+        ensure_valid!(self);
+        let wa = monitor.work_area;
+        #[allow(clippy::cast_precision_loss)]
+        let w_w = (wa.right - wa.left) as f32;
+        #[allow(clippy::cast_precision_loss)]
+        let w_h = (wa.bottom - wa.top) as f32;
+
+        // Default size: 80% of the work area, capped at a sane max.
+        let target_w = (w_w * 0.8).min(1600.0);
+        let target_h = (w_h * 0.8).min(1200.0);
+        #[allow(clippy::cast_precision_loss)]
+        let target_x = wa.left as f32 + (w_w - target_w) / 2.0;
+        #[allow(clippy::cast_precision_loss)]
+        let target_y = wa.top as f32 + (w_h - target_h) / 2.0;
+
+        self.move_to(
+            crate::utils::math::Position([target_x, target_y]),
+            crate::utils::math::Size([target_w, target_h]),
+        )
     }
 
     pub fn move_offscreen(self) -> anyhow::Result<()> {

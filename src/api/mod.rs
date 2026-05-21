@@ -40,6 +40,20 @@ pub struct ApiState {
     pub total_width: f32,
     pub screen_width: f32,
     pub screen_height: f32,
+    pub tiling_monitor_device_name: String,
+    pub monitors: Vec<MonitorSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MonitorSnapshot {
+    pub index: usize,
+    pub device_name: String,
+    pub is_primary: bool,
+    pub is_tiling: bool,
+    pub work_area_x: i32,
+    pub work_area_y: i32,
+    pub work_area_width: i32,
+    pub work_area_height: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +68,12 @@ pub struct WindowSnapshot {
     /// X position of the window's left edge in tile-strip coordinates
     /// (i.e. NOT screen-space; subtract scroll_offset to get on-screen X).
     pub x: f32,
+    /// Device name of the monitor the window is currently on
+    /// (e.g. `\\.\DISPLAY1`).
+    pub monitor: String,
+    /// `true` if the window is part of the tiler's strip, `false` if it's
+    /// a free-floating window.
+    pub tiled: bool,
 }
 
 static API_STATE: OnceLock<RwLock<ApiState>> = OnceLock::new();
@@ -83,7 +103,7 @@ pub fn set_command_sender(tx: Sender<Message>) {
     let _ = API_CMD_TX.set(Mutex::new(tx));
 }
 
-fn send_message(message: Message) -> Result<(), &'static str> {
+pub(crate) fn send_message(message: Message) -> Result<(), &'static str> {
     let Some(tx) = API_CMD_TX.get() else {
         return Err("api command sender not initialised");
     };

@@ -41,6 +41,9 @@ impl app::State {
             (Mode::Tiler { .. }, Modifiers::META, Key::KeyR) => {
                 Some(Action::Tiler(TilerAction::ForceRefresh))
             }
+            (Mode::Tiler { .. }, Modifiers::META, Key::KeyH) => {
+                Some(Action::Tiler(TilerAction::CenterFocused))
+            }
             (Mode::Tiler { .. }, Modifiers::META, Key::Comma) => Some(Action::OpenSettings),
             (Mode::Tiler { .. }, _, Key::LeftArrow)
                 if modifiers == Modifiers::META.union(Modifiers::SHIFT) =>
@@ -106,9 +109,16 @@ impl app::State {
                     self.tiler.decrement_current_window_width();
                     self.update_tiler()?;
                 }
+                TilerAction::CenterFocused => {
+                    self.tiler.center_focused_window();
+                }
                 TilerAction::ForceRefresh => {
                     if let Err(e) = crate::config::reload() {
                         log::warn!("Config reload failed, keeping previous config: {e:#}");
+                    } else {
+                        let cfg = crate::config::current();
+                        self.tiler
+                            .set_smoothing(cfg.tiling.smooth_scroll, cfg.tiling.smooth_scroll_factor);
                     }
                     self.update_tiler()?;
                 }

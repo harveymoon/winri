@@ -12,8 +12,16 @@
 use std::{panic, path::PathBuf};
 
 use anyhow::{Context, anyhow};
+use windows::{
+    Win32::{
+        Foundation::{ERROR_ALREADY_EXISTS, GetLastError},
+        System::Threading::CreateMutexW,
+    },
+    core::w,
+};
 
 mod adapter;
+mod api;
 mod app;
 mod bug_report;
 mod config;
@@ -34,7 +42,43 @@ pub fn root_dir() -> anyhow::Result<PathBuf> {
         .join(PROJECT_DIR_NAME))
 }
 
+/// Acquire a named mutex so only one winri can run per user session.
+/// Returns `true` if we are the first instance; `false` if another winri
+/// already holds the mutex.
+fn acquire_single_instance() -> bool {
+    // `Local\` prefix scopes the mutex to the current Terminal Services
+    // session, which is exactly what we want for a per-user tiler — running
+    // winri across multiple logged-in user sessions shouldn't conflict.
+    let handle = unsafe { CreateMutexW(None, true, w!("Local\\WinriSingleInstance")) };
+    if handle.is_err() {
+        // Couldn't even create the mutex — let winri continue rather than
+        // false-positive-blocking.
+        return true;
+    }
+    let already_exists = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+    // Deliberately leak the handle: we want it held for the lifetime of the
+    // process so the kernel releases it when winri exits.
+    if already_exists {
+        // Drop the handle so we don't accidentally hold a reference that
+        // confuses the existing instance.
+        if let Ok(h) = handle {
+            let _ = unsafe { windows::Win32::Foundation::CloseHandle(h) };
+        }
+        false
+    } else {
+        std::mem::forget(handle);
+        true
+    }
+}
+
 fn main() {
+    if !acquire_single_instance() {
+        crate::bug_report::display_and_exit(anyhow!(
+            "Another winri is already running. Exit it (Win+Esc) before launching again."
+        ));
+        std::process::exit(0);
+    }
+
     let default_hook = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
         log::error!("Winri panicked: {info}");

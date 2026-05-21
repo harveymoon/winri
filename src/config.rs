@@ -19,6 +19,29 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     pub tiling: TilingConfig,
     pub filter: FilterConfig,
+    pub api: ApiConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ApiConfig {
+    /// Whether to start the local HTTP control API on launch.
+    pub enabled: bool,
+    /// Bind address. Default is loopback only — exposing winri's control API
+    /// to other hosts is almost always a mistake.
+    pub bind: String,
+    /// TCP port for the HTTP API.
+    pub port: u16,
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: "127.0.0.1".to_string(),
+            port: 47812,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +49,13 @@ pub struct Config {
 pub struct TilingConfig {
     pub padding: f32,
     pub resize_increment: f32,
+    /// Animate scroll/focus changes instead of snapping. When false the
+    /// tiler still functions identically — values just jump.
+    pub smooth_scroll: bool,
+    /// Per-tick interpolation factor in [0.05, 1.0]. Higher = snappier,
+    /// lower = floatier. At 60 fps, 0.2 settles to within 1% in ~22 frames
+    /// (~360 ms); 0.4 in ~9 frames (~150 ms).
+    pub smooth_scroll_factor: f32,
 }
 
 impl Default for TilingConfig {
@@ -33,6 +63,8 @@ impl Default for TilingConfig {
         Self {
             padding: 10.0,
             resize_increment: 20.0,
+            smooth_scroll: true,
+            smooth_scroll_factor: 0.25,
         }
     }
 }
@@ -55,6 +87,10 @@ const DEFAULT_CONFIG_TOML: &str = r#"# Winri configuration
 padding = 10.0
 # How much Win+Shift+Left/Right resizes the focused window by.
 resize_increment = 20.0
+# Animate scroll & focus jumps instead of snapping.
+smooth_scroll = true
+# Snappiness of the smoothing (0.05 = floaty, 1.0 = effectively snap).
+smooth_scroll_factor = 0.25
 
 [filter]
 # Extra process executables (.exe filename, case-sensitive) to exempt from
@@ -67,6 +103,15 @@ ignored_processes = [
 ignored_classes = [
     # "SomeOverlayClass",
 ]
+
+[api]
+# Local HTTP control API. When enabled, exposes endpoints to enumerate
+# tiled windows, focus them, scroll, fire keyboard-equivalent actions, and
+# fetch live thumbnails — useful for Stream Deck plugins, Python macros,
+# voice control, etc. See INTEGRATION.md.
+enabled = false
+bind = "127.0.0.1"
+port = 47812
 "#;
 
 static CONFIG: OnceLock<RwLock<Config>> = OnceLock::new();

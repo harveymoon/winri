@@ -20,6 +20,21 @@ pub struct SettingsForm {
     pub new_process: String,
     pub new_class: String,
     pub status: Option<String>,
+    /// Snapshot of the currently-tiled windows when the settings panel was
+    /// opened. Lets the user one-click "Ignore" instead of typing exe names.
+    pub current_windows: Vec<WindowInfo>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WindowInfo {
+    /// `chrome.exe`, etc.
+    pub process: String,
+    /// Win32 window class name.
+    pub class: String,
+    /// Display name derived from the process exe (e.g. "Chrome").
+    pub app_name: String,
+    /// Truncated window title for display.
+    pub title: String,
 }
 
 #[derive(Debug, Clone)]
@@ -28,9 +43,11 @@ pub enum SettingsMessage {
     ResizeIncrementChanged(String),
     NewProcessChanged(String),
     AddProcess,
+    AddProcessByName(String),
     RemoveProcess(usize),
     NewClassChanged(String),
     AddClass,
+    AddClassByName(String),
     RemoveClass(usize),
     ReloadFromDisk,
     Save,
@@ -38,8 +55,9 @@ pub enum SettingsMessage {
 }
 
 impl SettingsForm {
-    /// Populate the form from the live config.
-    pub fn from_current_config() -> Self {
+    /// Populate the form from the live config and a snapshot of currently
+    /// tiled windows.
+    pub fn from_current_config(current_windows: Vec<WindowInfo>) -> Self {
         let cfg = config::current();
         Self {
             padding: cfg.tiling.padding.to_string(),
@@ -49,6 +67,7 @@ impl SettingsForm {
             new_process: String::new(),
             new_class: String::new(),
             status: None,
+            current_windows,
         }
     }
 
@@ -66,15 +85,27 @@ impl SettingsForm {
                 self.resize_increment
             )
         })?;
+        // Preserve config fields the settings UI doesn't currently expose
+        // (api section, smooth-scroll knobs) by reading them from the live
+        // config and passing them through unchanged.
+        let live = config::current();
+        let api = live.api.clone();
+        let smooth_scroll = live.tiling.smooth_scroll;
+        let smooth_scroll_factor = live.tiling.smooth_scroll_factor;
+        drop(live);
+
         Ok(config::Config {
             tiling: config::TilingConfig {
                 padding,
                 resize_increment,
+                smooth_scroll,
+                smooth_scroll_factor,
             },
             filter: config::FilterConfig {
                 ignored_processes: self.ignored_processes.clone(),
                 ignored_classes: self.ignored_classes.clone(),
             },
+            api,
         })
     }
 }
@@ -98,6 +129,11 @@ pub fn update(form: &mut SettingsForm, message: SettingsMessage) -> bool {
             }
             form.new_process.clear();
         }
+        SettingsMessage::AddProcessByName(name) => {
+            if !name.is_empty() && !form.ignored_processes.iter().any(|p| p == &name) {
+                form.ignored_processes.push(name);
+            }
+        }
         SettingsMessage::RemoveProcess(i) => {
             if i < form.ignored_processes.len() {
                 form.ignored_processes.remove(i);
@@ -111,6 +147,11 @@ pub fn update(form: &mut SettingsForm, message: SettingsMessage) -> bool {
             }
             form.new_class.clear();
         }
+        SettingsMessage::AddClassByName(name) => {
+            if !name.is_empty() && !form.ignored_classes.iter().any(|c| c == &name) {
+                form.ignored_classes.push(name);
+            }
+        }
         SettingsMessage::RemoveClass(i) => {
             if i < form.ignored_classes.len() {
                 form.ignored_classes.remove(i);
@@ -120,7 +161,15 @@ pub fn update(form: &mut SettingsForm, message: SettingsMessage) -> bool {
             if let Err(e) = config::reload() {
                 form.status = Some(format!("Reload failed: {e:#}"));
             } else {
-                *form = SettingsForm::from_current_config();
+                // Re-read config but keep the captured window snapshot — those
+                // are the currently-tiled windows, not a config field.
+                let cfg = config::current();
+                form.padding = cfg.tiling.padding.to_string();
+                form.resize_increment = cfg.tiling.resize_increment.to_string();
+                form.ignored_processes = cfg.filter.ignored_processes.clone();
+                form.ignored_classes = cfg.filter.ignored_classes.clone();
+                form.new_process.clear();
+                form.new_class.clear();
                 form.status = Some("Reloaded from disk.".into());
             }
         }
@@ -187,6 +236,8 @@ pub fn view(form: &SettingsForm) -> Element<'_, app::Message> {
         |i| msg(SettingsMessage::RemoveClass(i)),
     );
 
+    let current_section = current_windows_section(form);
+
     let status_line: Element<'_, app::Message> = if let Some(msg_text) = &form.status {
         text(msg_text.as_str()).size(13).into()
     } else {
@@ -209,6 +260,7 @@ pub fn view(form: &SettingsForm) -> Element<'_, app::Message> {
     let content = column![
         title,
         tiling_section,
+        current_section,
         processes_section,
         classes_section,
         status_line,
@@ -225,6 +277,92 @@ pub fn view(form: &SettingsForm) -> Element<'_, app::Message> {
 
 fn msg(m: SettingsMessage) -> app::Message {
     app::Message::Settings(m)
+}
+
+fn current_windows_section(form: &SettingsForm) -> Element<'_, app::Message> {
+    let header = text("Currently tiled apps").size(16);
+    let hint = text("Quick-add to the ignore lists below without typing exe names.").size(11);
+
+    if form.current_windows.is_empty() {
+        return column![header, hint, text("(no tiled windows right now)").size(12)]
+            .spacing(8)
+            .into();
+    }
+
+    // Consolidate windows by process so e.g. four Chrome windows show as one
+    // row ("Chrome (4)") instead of cluttering the list. The first window we
+    // see for each process is treated as the representative for the class
+    // name displayed; that's fine because almost all multi-window apps use
+    // the same class for their main windows.
+    struct Group<'a> {
+        app_name: &'a str,
+        process: &'a str,
+        representative_class: &'a str,
+        count: usize,
+        sample_title: &'a str,
+    }
+    let mut groups: Vec<Group<'_>> = Vec::new();
+    for win in &form.current_windows {
+        if let Some(g) = groups.iter_mut().find(|g| g.process == win.process) {
+            g.count += 1;
+        } else {
+            groups.push(Group {
+                app_name: &win.app_name,
+                process: &win.process,
+                representative_class: &win.class,
+                count: 1,
+                sample_title: &win.title,
+            });
+        }
+    }
+
+    let mut list = column![].spacing(6);
+    for g in &groups {
+        let exe_ignored = form.ignored_processes.iter().any(|p| p == g.process);
+        let class_ignored = form
+            .ignored_classes
+            .iter()
+            .any(|c| c == g.representative_class);
+
+        let title_or_count = if g.count == 1 {
+            g.sample_title.to_string()
+        } else {
+            format!("{} windows", g.count)
+        };
+
+        let info_column = column![
+            text(g.app_name).size(14),
+            text(title_or_count).size(11),
+            text(format!("{}  •  {}", g.process, g.representative_class)).size(10),
+        ]
+        .spacing(2)
+        .width(Length::Fill);
+
+        let exe_button: Element<'_, app::Message> = if exe_ignored {
+            text("✓ exe").size(11).into()
+        } else {
+            button(text("Ignore exe").size(11))
+                .on_press(msg(SettingsMessage::AddProcessByName(g.process.to_string())))
+                .into()
+        };
+        let class_button: Element<'_, app::Message> = if class_ignored {
+            text("✓ class").size(11).into()
+        } else {
+            button(text("Ignore class").size(11))
+                .on_press(msg(SettingsMessage::AddClassByName(
+                    g.representative_class.to_string(),
+                )))
+                .into()
+        };
+
+        list = list.push(
+            row![info_column, exe_button, class_button]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+        );
+    }
+
+    column![header, hint, list].spacing(8).into()
 }
 
 fn list_section<'a>(

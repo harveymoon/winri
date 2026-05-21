@@ -144,6 +144,10 @@ pub fn highlight_color() -> anyhow::Result<iced::Color> {
 
 /// Restore all tiled windows to a cascading position for user convenience.
 /// Typically called on application exit (nominal or error), so that windows are not lost off-screen.
+///
+/// We cascade from the top-left in small 30-pixel steps and wrap horizontally
+/// before any window falls past the bottom of the work area — the old +100
+/// step would slide ~14 windows diagonally off-screen on a normal display.
 pub fn restore_windows() {
     let mut windows = Window::enumerate().unwrap_or_else(|e| {
         warn!("Could not enumerate windows to restore them: {e}");
@@ -152,12 +156,31 @@ pub fn restore_windows() {
 
     windows.retain(|w| window::filter::should_be_tiled(*w).unwrap_or(false));
 
-    let mut pos = Position([100.0, 100.0]);
-    for window in windows {
-        if let Err(err) = window.move_to(pos, [800.0, 600.0].into()) {
+    let work_area = screen_size().unwrap_or_else(|_| crate::utils::math::Size([1920.0, 1080.0]));
+    let win_size = [800.0_f32, 600.0_f32];
+
+    const STEP: f32 = 30.0;
+    const ORIGIN_X: f32 = 50.0;
+    const ORIGIN_Y: f32 = 50.0;
+
+    // How many cascade steps fit vertically before a window's bottom would
+    // fall off the work area. We use that to wrap into a new column.
+    let max_vertical_steps = (((work_area.height() - win_size[1] - ORIGIN_Y) / STEP).floor() as i32)
+        .max(0) as usize
+        + 1;
+    let column_width: f32 = 60.0;
+
+    for (i, window) in windows.into_iter().enumerate() {
+        let column = i / max_vertical_steps;
+        let row = i % max_vertical_steps;
+        #[allow(clippy::cast_precision_loss)]
+        let pos = Position([
+            ORIGIN_X + (column as f32) * column_width,
+            ORIGIN_Y + (row as f32) * STEP,
+        ]);
+        if let Err(err) = window.move_to(pos, win_size.into()) {
             warn!("Failed to move window {window:?}: {err}");
         }
-        pos += 100.0;
     }
 }
 

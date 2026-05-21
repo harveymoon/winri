@@ -19,7 +19,10 @@ keyboard-types = { version = "0.8", features = ["std", "serde"] }
 dirs = "6"
 webbrowser = "1"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.8"
+tiny_http = "0.12"
+png = "0.17"
 
 [dependencies.windows]
 version = "0.62"
@@ -28,9 +31,11 @@ features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Accessibility",
     "Win32_System_Threading",
+    "Win32_Security",
     "Win32_System_ProcessStatus",
     "Win32_Graphics_Dwm",
-    "Win32_Graphics_Gdi"
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_Xps"
 ]
 
 [dependencies.iced]

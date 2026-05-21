@@ -61,9 +61,27 @@ pub enum Message {
 
     Settings(settings::SettingsMessage),
 
-    /// Left mouse button pressed on an iced window. Used in Overview mode
-    /// to jump to the clicked thumbnail's source window.
-    WindowClicked(iced::window::Id),
+    /// Command from the local HTTP control API.
+    Api(crate::api::ApiCommand),
+
+    /// 60 fps tick that advances the smoothing animation when one is active.
+    AnimationTick,
+
+    /// Cursor moved within an iced window. We stash the position so the
+    /// next press/release can hit-test against the overview thumbnails.
+    WindowCursorMoved {
+        window_id: iced::window::Id,
+        position: iced::Point,
+    },
+
+    /// Left mouse button pressed inside an iced window. We record this so we
+    /// can distinguish a click from a drag on the matching mouse-up.
+    WindowMouseDown(iced::window::Id),
+
+    /// Left mouse button released inside an iced window. If the cursor moved
+    /// only a few pixels since mouse-down (i.e. a click, not a drag), the
+    /// overview-mode handler will use this to jump to the clicked thumbnail.
+    WindowMouseUp(iced::window::Id),
 
     CleanupAndExit,
 }
@@ -103,11 +121,17 @@ fn create_settings_window() -> (iced::window::Id, Task<Message>) {
 impl State {
     pub fn new() -> (Self, Task<Message>) {
         let screen_size = system::screen_size().expect("Screen size retrieval");
-        let (padding, resize_increment) = {
+        let (padding, resize_increment, smooth_enabled, smooth_factor) = {
             let cfg = config::current();
-            (cfg.tiling.padding, cfg.tiling.resize_increment)
+            (
+                cfg.tiling.padding,
+                cfg.tiling.resize_increment,
+                cfg.tiling.smooth_scroll,
+                cfg.tiling.smooth_scroll_factor,
+            )
         };
-        let tiler = ScrollTiler::new(padding, resize_increment, screen_size);
+        let mut tiler = ScrollTiler::new(padding, resize_increment, screen_size);
+        tiler.set_smoothing(smooth_enabled, smooth_factor);
         let (overlay_window_id, overlay_window_creation_task) = create_overlay_window(screen_size);
         (
             Self {
@@ -132,11 +156,55 @@ impl State {
         if let Some(existing) = self.settings_window_id {
             return iced::window::gain_focus(existing);
         }
-        self.settings_form = settings::SettingsForm::from_current_config();
+        let current_windows = self.snapshot_tiled_windows_for_settings();
+        self.settings_form = settings::SettingsForm::from_current_config(current_windows);
         let (id, task) = create_settings_window();
         self.settings_window_id = Some(id);
         task
     }
+
+    /// Snapshot the tiled windows in a form the settings panel can render
+    /// (display name, exe, class, title). Failures per-window are tolerated
+    /// — we just skip windows we can't introspect.
+    fn snapshot_tiled_windows_for_settings(&self) -> Vec<settings::WindowInfo> {
+        const MAX_TITLE_CHARS: usize = 70;
+
+        self.tiler
+            .windows()
+            .filter_map(|item| {
+                let process = item.inner.process_name().ok()?;
+                let class = item.inner.class().ok()?;
+                let title = item.inner.title().ok().flatten().unwrap_or_default();
+                let truncated_title = if title.chars().count() > MAX_TITLE_CHARS {
+                    title.chars().take(MAX_TITLE_CHARS - 1).collect::<String>() + "…"
+                } else {
+                    title
+                };
+                let app_name = display_name_from_process(&process);
+                Some(settings::WindowInfo {
+                    process,
+                    class,
+                    app_name,
+                    title: truncated_title,
+                })
+            })
+            .collect()
+    }
+}
+
+fn display_name_from_process(process_name: &str) -> String {
+    let stem = process_name
+        .strip_suffix(".exe")
+        .or_else(|| process_name.strip_suffix(".EXE"))
+        .unwrap_or(process_name);
+    let mut chars = stem.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect::<String>(),
+        None => stem.to_owned(),
+    }
+}
+
+impl State {
 
     fn close_settings(&mut self) -> Task<Message> {
         if let Some(id) = self.settings_window_id.take() {
@@ -146,6 +214,57 @@ impl State {
         }
     }
 
+    fn handle_api_command(&mut self, command: crate::api::ApiCommand) -> Task<Message> {
+        use crate::api::{ApiCommand, NamedAction};
+
+        match command {
+            ApiCommand::Focus(hwnd_raw) => {
+                if let Ok(window) = window::Window::from_safe_hwnd(hwnd_raw)
+                    && let Err(e) = window.focus()
+                {
+                    log::warn!("API Focus({hwnd_raw}) failed: {e:#}");
+                }
+                Task::none()
+            }
+            ApiCommand::SetScrollOffset(offset) => {
+                if matches!(self.mode, Mode::Tiler(_)) {
+                    self.tiler.set_scroll_offset(offset);
+                }
+                Task::none()
+            }
+            ApiCommand::ScrollBy(delta) => {
+                if matches!(self.mode, Mode::Tiler(_)) {
+                    self.tiler.scroll_by(delta);
+                }
+                Task::none()
+            }
+            ApiCommand::Action(named) => Task::done(Message::Action(named_action_to_action(named))),
+        }
+    }
+}
+
+fn named_action_to_action(named: crate::api::NamedAction) -> action::Action {
+    use crate::api::NamedAction;
+    use action::{Action, OverviewAction, TilerAction};
+    match named {
+        NamedAction::FocusPrev => Action::Tiler(TilerAction::MoveFocusPrevious),
+        NamedAction::FocusNext => Action::Tiler(TilerAction::MoveFocusNext),
+        NamedAction::SwapPrev => Action::Tiler(TilerAction::SwapWithPrevious),
+        NamedAction::SwapNext => Action::Tiler(TilerAction::SwapWithNext),
+        NamedAction::ResizeFullscreen => Action::Tiler(TilerAction::ResizeToFullscreen),
+        NamedAction::ResizeHalfscreen => Action::Tiler(TilerAction::ResizeToHalfScreen),
+        NamedAction::WidthIncrement => Action::Tiler(TilerAction::IncrementWidth),
+        NamedAction::WidthDecrement => Action::Tiler(TilerAction::DecrementWidth),
+        NamedAction::Refresh => Action::Tiler(TilerAction::ForceRefresh),
+        NamedAction::CenterFocused => Action::Tiler(TilerAction::CenterFocused),
+        NamedAction::OpenOverview => Action::Tiler(TilerAction::OpenOverview),
+        NamedAction::CloseOverview => Action::Overview(OverviewAction::CloseOverview),
+        NamedAction::OpenSettings => Action::OpenSettings,
+        NamedAction::Exit => Action::Exit,
+    }
+}
+
+impl State {
     pub fn title(_: &Self, _window_id: iced::window::Id) -> String {
         window::filter::WINRI_IGNORED_WINDOW_TITLE_SUBSTRING.into()
     }
@@ -185,11 +304,37 @@ impl State {
                     task = task.chain(self.close_settings());
                 }
             }
-            Message::WindowClicked(window_id) => {
-                if let Some(target) = self.window_at_thumbnail_id(window_id) {
-                    task = task.chain(Task::done(Message::Action(action::Action::Overview(
-                        action::OverviewAction::JumpTo(target),
-                    ))));
+            Message::Api(api_command) => {
+                task = task.chain(self.handle_api_command(api_command));
+            }
+            Message::AnimationTick => {
+                if self.tiler.is_animating() {
+                    self.tiler.tick_animation();
+                }
+            }
+            Message::WindowCursorMoved {
+                window_id,
+                position,
+            } => {
+                self.handle_overview_cursor_moved(window_id, position);
+            }
+            Message::WindowMouseDown(window_id) => {
+                self.handle_overview_mouse_pressed(window_id);
+            }
+            Message::WindowMouseUp(window_id) => {
+                use crate::app::service::overview::ReleaseOutcome;
+                match self.overview_release_outcome(window_id) {
+                    Some(ReleaseOutcome::Click(target)) => {
+                        task = task.chain(Task::done(Message::Action(action::Action::Overview(
+                            action::OverviewAction::JumpTo(target),
+                        ))));
+                    }
+                    Some(ReleaseOutcome::Reorder { src, dst }) => {
+                        if let Err(e) = self.reorder_overview(src, dst) {
+                            log::warn!("Reorder failed: {e:#}");
+                        }
+                    }
+                    None => {}
                 }
             }
         }
@@ -212,6 +357,13 @@ impl State {
                     .handle_faillible_process()
                     .discard();
             }
+            GlobalMessage::HorizontalScroll { delta_px } => {
+                // Only meaningful in Tiler mode; the overview window doesn't
+                // share the strip's scroll state.
+                if matches!(self.mode, Mode::Tiler(_)) {
+                    self.tiler.scroll_by(delta_px);
+                }
+            }
         }
         Task::none()
     }
@@ -221,6 +373,10 @@ impl State {
             view::overlay::view(self)
         } else if Some(window_id) == self.settings_window_id {
             settings::view(&self.settings_form)
+        } else if let Mode::Overview(state) = &self.mode
+            && state.overview_window_id == window_id
+        {
+            view::overview::view(state)
         } else {
             view::empty()
         }
@@ -235,16 +391,34 @@ impl State {
                     ..Palette::DARK
                 },
             )
+        } else if Some(window_id) == self.overview_window_id() {
+            // Dimmed semi-transparent backdrop so thumbnails pop while
+            // letting the desktop bleed through faintly.
+            iced::Theme::custom(
+                "Overview backdrop",
+                Palette {
+                    background: Color::from_rgba(0.0, 0.0, 0.0, 0.55),
+                    ..Palette::DARK
+                },
+            )
         } else {
             iced::Theme::Dark // TODO: Adapt to system theme
         }
     }
 
-    pub fn subscription(_: &Self) -> iced::Subscription<Message> {
-        iced::Subscription::batch([
+    pub fn subscription(state: &Self) -> iced::Subscription<Message> {
+        let mut subs = vec![
             iced::Subscription::run(subscription::global::subscription),
+            iced::Subscription::run(subscription::api::subscription),
             iced::event::listen_with(on_event),
-        ])
+        ];
+        if state.tiler.wants_redraw() {
+            subs.push(
+                iced::time::every(std::time::Duration::from_millis(16))
+                    .map(|_| Message::AnimationTick),
+            );
+        }
+        iced::Subscription::batch(subs)
     }
 }
 
@@ -255,10 +429,20 @@ fn on_event(
 ) -> Option<Message> {
     use iced::mouse::{Button, Event as MouseEvent};
 
-    if matches!(event, iced::Event::Mouse(MouseEvent::ButtonPressed(Button::Left))) {
-        Some(Message::WindowClicked(window_id))
-    } else {
-        None
+    match event {
+        iced::Event::Mouse(MouseEvent::CursorMoved { position }) => {
+            Some(Message::WindowCursorMoved {
+                window_id,
+                position,
+            })
+        }
+        iced::Event::Mouse(MouseEvent::ButtonPressed(Button::Left)) => {
+            Some(Message::WindowMouseDown(window_id))
+        }
+        iced::Event::Mouse(MouseEvent::ButtonReleased(Button::Left)) => {
+            Some(Message::WindowMouseUp(window_id))
+        }
+        _ => None,
     }
 }
 

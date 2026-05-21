@@ -17,15 +17,24 @@ use windows::Win32::{
 };
 
 use crate::{
-    app::service::overview::{self, ThumbnailWindowCreated},
-    utils::math::{Position, Size},
+    app::{self, service::overview},
+    utils::math::Size,
     wincall_result,
     window::Window,
 };
 
-pub struct ThumbnailData {
-    pub pos: Position,
-    pub size: Size,
+#[derive(Debug, Clone, Copy)]
+pub struct ThumbnailRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+impl ThumbnailRect {
+    pub fn contains(&self, x: f64, y: f64) -> bool {
+        x >= self.x && x < self.x + self.width && y >= self.y && y < self.y + self.height
+    }
 }
 
 pub struct WindowData {
@@ -33,12 +42,17 @@ pub struct WindowData {
     pub width: f32,
 }
 
-pub fn compute_thumbnails_bounds_from_tiler_windows(
+pub struct ThumbnailLayout {
+    pub rect: ThumbnailRect,
+}
+
+/// Lay out thumbnails as a centered horizontal strip, scaled down from the
+/// tiler's full width.
+pub fn compute_thumbnail_layouts(
     windows: &[WindowData],
     screen_size: Size,
     padding: f32,
-) -> Vec<ThumbnailData> {
-    // Width of packed windows
+) -> Vec<ThumbnailLayout> {
     let total_tiler_width = windows.iter().map(|w| w.width + padding).sum::<f32>() - padding;
 
     let reduction_ratio = screen_size.width() / total_tiler_width;
@@ -58,7 +72,7 @@ pub fn compute_thumbnails_bounds_from_tiler_windows(
     debug!("Thumbnail reduction ratio after size adaptation: {reduction_ratio}");
 
     let mut current_x = 0.0;
-    let mut thumbnails = Vec::new();
+    let mut layouts = Vec::new();
 
     let thumbnail_height = reduction_ratio * screen_size.height();
     let thumbnail_y = (screen_size.height() - thumbnail_height).abs() / 2.0;
@@ -67,63 +81,67 @@ pub fn compute_thumbnails_bounds_from_tiler_windows(
 
     for window in windows {
         let width = reduction_ratio * window.width;
-        thumbnails.push(ThumbnailData {
-            pos: [current_x + thumbnail_x_center_offset, thumbnail_y].into(),
-            size: [width, thumbnail_height].into(),
+        layouts.push(ThumbnailLayout {
+            rect: ThumbnailRect {
+                x: f64::from(current_x + thumbnail_x_center_offset),
+                y: f64::from(thumbnail_y),
+                width: f64::from(width),
+                height: f64::from(thumbnail_height),
+            },
         });
         current_x += width + padding;
     }
 
-    thumbnails
+    layouts
 }
 
-pub fn thumbnail_window_creation_task(
-    source_window: Window,
-    at: Position,
-    size: Size,
-) -> Task<overview::Message> {
-    let (_, window_creation) = iced::window::open(Settings {
+/// Open the single fullscreen overview window. On creation, emits an
+/// `OverviewWindowCreated` message carrying the iced id and raw HWND so the
+/// caller can bind DWM thumbnails into it.
+///
+/// We rely on iced's own visibility/level handling rather than calling Win32
+/// `ShowWindow` ourselves — that flow has been flaky on iced-managed windows
+/// in this fork (intermittent "system cannot find the file" errors).
+pub fn open_overview_window(screen_size: Size) -> Task<app::Message> {
+    let (id, window_creation) = iced::window::open(Settings {
         decorations: false,
-        size: size.into(),
-        position: iced::window::Position::Specific(at.into()),
+        transparent: true,
+        size: screen_size.into(),
+        position: iced::window::Position::Specific(iced::Point::ORIGIN),
         resizable: false,
-        visible: false,
+        visible: true,
+        level: iced::window::Level::AlwaysOnTop,
         platform_specific: PlatformSpecific {
             skip_taskbar: true,
-            corner_preference: CornerPreference::Round,
+            corner_preference: CornerPreference::Default,
             ..Default::default()
         },
         ..Default::default()
     });
 
     window_creation
-        .then(|id| {
-            iced::window::raw_id::<overview::Message>(id)
-                .then(move |raw_handle| Task::done((id, raw_handle)))
-        })
-        .then(move |(id, raw_handle)| {
-            Task::done(overview::Message::ThumbnailWindowCreated(
-                ThumbnailWindowCreated {
-                    src: source_window,
-                    dest_id: id,
-                    dest_raw_handle: raw_handle,
-                    pos: at,
-                    size,
-                },
+        .then(move |_| iced::window::raw_id::<app::Message>(id))
+        .then(move |raw_handle| {
+            Task::done(app::Message::Overview(
+                overview::Message::OverviewWindowCreated { id, raw_handle },
             ))
         })
 }
 
-pub fn bind_thumbnail(src: Window, dest: Window, size: Size) -> anyhow::Result<ThumbnailId> {
+pub fn register_thumbnail(
+    src: Window,
+    dest: Window,
+    rect: ThumbnailRect,
+) -> anyhow::Result<ThumbnailId> {
     let thumbnail_id = wincall_result!(DwmRegisterThumbnail(dest.handle(), src.handle()))?;
 
-    let thumbnail_props = DWM_THUMBNAIL_PROPERTIES {
+    let props = DWM_THUMBNAIL_PROPERTIES {
         dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE,
         rcDestination: RECT {
-            left: 0,
-            top: 0,
-            right: size.width() as i32,
-            bottom: size.height() as i32,
+            left: rect.x as i32,
+            top: rect.y as i32,
+            right: (rect.x + rect.width) as i32,
+            bottom: (rect.y + rect.height) as i32,
         },
         rcSource: RECT {
             left: 0,
@@ -136,15 +154,37 @@ pub fn bind_thumbnail(src: Window, dest: Window, size: Size) -> anyhow::Result<T
         fSourceClientAreaOnly: true.into(),
     };
 
-    wincall_result!(DwmUpdateThumbnailProperties(
-        thumbnail_id,
-        &raw const thumbnail_props
-    ))?;
+    wincall_result!(DwmUpdateThumbnailProperties(thumbnail_id, &raw const props))?;
 
     Ok(thumbnail_id)
 }
 
 pub fn unbind_thumbnail(thumbnail_id: ThumbnailId) -> anyhow::Result<()> {
     wincall_result!(DwmUnregisterThumbnail(thumbnail_id))?;
+    Ok(())
+}
+
+/// Update an already-registered thumbnail's destination rect. Used to
+/// re-layout after drag-reorder without unregistering and re-registering.
+pub fn update_thumbnail_rect(thumbnail_id: ThumbnailId, rect: ThumbnailRect) -> anyhow::Result<()> {
+    let props = DWM_THUMBNAIL_PROPERTIES {
+        dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE,
+        rcDestination: RECT {
+            left: rect.x as i32,
+            top: rect.y as i32,
+            right: (rect.x + rect.width) as i32,
+            bottom: (rect.y + rect.height) as i32,
+        },
+        rcSource: RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        },
+        opacity: 0,
+        fVisible: true.into(),
+        fSourceClientAreaOnly: true.into(),
+    };
+    wincall_result!(DwmUpdateThumbnailProperties(thumbnail_id, &raw const props))?;
     Ok(())
 }

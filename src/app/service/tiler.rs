@@ -74,7 +74,55 @@ impl app::State {
 
         self.update_tiler_border()?;
 
+        self.publish_api_snapshot();
+
         Ok(())
+    }
+
+    /// Push the latest tiler view to the API state so `/state` and `/windows`
+    /// reflect reality. Best-effort; bad introspection on any one window is
+    /// just skipped.
+    pub(crate) fn publish_api_snapshot(&self) {
+        let screen = self.tiler.screen_size();
+        let mut windows = Vec::new();
+        let mut current_x = self.tiler.padding();
+        let mut focused_window_id: Option<u64> = None;
+        for item in self.tiler.windows() {
+            let hwnd_raw = item.inner.handle().0 as u64;
+            let title = item.inner.title().ok().flatten().unwrap_or_default();
+            let process = item.inner.process_name().unwrap_or_default();
+            let class = item.inner.class().unwrap_or_default();
+            let focused = item.inner.is_focused().unwrap_or(false);
+            if focused {
+                focused_window_id = Some(hwnd_raw);
+            }
+            windows.push(crate::api::WindowSnapshot {
+                id: hwnd_raw,
+                title,
+                process,
+                class,
+                width: item.width,
+                x: current_x,
+            });
+            current_x += item.width + self.tiler.padding();
+        }
+
+        let mode = match &self.mode {
+            Mode::Tiler(_) => "tiler",
+            Mode::Overview(_) => "overview",
+            Mode::Exit => "exit",
+        }
+        .to_string();
+
+        crate::api::publish_state(crate::api::ApiState {
+            mode,
+            windows,
+            focused_window_id,
+            scroll_offset: self.tiler.scroll_offset(),
+            total_width: self.tiler.total_strip_width(),
+            screen_width: screen.width(),
+            screen_height: screen.height(),
+        });
     }
 
     pub fn update_tiler_border(&mut self) -> anyhow::Result<()> {

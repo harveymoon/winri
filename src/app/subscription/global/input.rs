@@ -1,11 +1,14 @@
-use std::{thread, time::Duration};
+use std::{sync::atomic::Ordering, thread, time::Duration};
 
 use iced::futures::channel::mpsc::Sender;
 use joy_error::ResultUtilityExt;
 use keyboard_types::Modifiers;
 use rdev::simulate;
 
-use crate::{app::subscription::global::GlobalMessage, system};
+use crate::{
+    app::subscription::global::{GlobalMessage, WIN_DOWN},
+    system,
+};
 
 fn grab_event_processing(
     event: rdev::Event,
@@ -44,6 +47,7 @@ fn grab_event_processing(
                 // Got an unknown key code for the right Meta key for some reason
                 Key::MetaLeft | Key::MetaRight | Key::Unknown(92) => {
                     modifiers.set(Modifiers::META, true);
+                    WIN_DOWN.store(true, Ordering::Relaxed);
                     // Win key presses are swallowed to avoid opening the Start Menu, and triggering system shortcuts
                     // Winri is supposed to be a sort of "command center" for the system, so the native system shortcuts should not be needed
                     // I know this might be controversial, but it's the intended behavior for now, and I'm open to feedback on this matter
@@ -79,6 +83,7 @@ fn grab_event_processing(
                 // Got an unknown key code for the right Meta key for some reason
                 Key::MetaLeft | Key::MetaRight | Key::Unknown(92) => {
                     modifiers.set(Modifiers::META, false);
+                    WIN_DOWN.store(false, Ordering::Relaxed);
                     return None;
                 }
                 _ => {}

@@ -103,6 +103,13 @@ pub struct FilterConfig {
 pub struct IgnoredWindowTitle {
     pub process: String,
     pub title: String,
+    /// Optional Win32 window class. When present the match also requires
+    /// `class` equality, which keeps a popup from accidentally silencing
+    /// its app's main window when both share the same class but differ
+    /// only by title. Older config entries without `class` fall back to
+    /// the previous (process, title)-only behaviour.
+    #[serde(default)]
+    pub class: Option<String>,
 }
 
 const DEFAULT_CONFIG_TOML: &str = r#"# Winri configuration
@@ -210,6 +217,11 @@ pub fn reload() -> anyhow::Result<()> {
 }
 
 /// Write the given config to disk and replace the in-memory copy.
+///
+/// The write is atomic from the reader's perspective: we write to a
+/// sibling temp file and then `rename` it over the real config. If
+/// winri crashes mid-write the original config stays intact and the
+/// `.tmp` file can be cleaned up on next launch.
 pub fn save(cfg: Config) -> anyhow::Result<()> {
     let path = config_path()?;
     if let Some(parent) = path.parent() {
@@ -218,8 +230,17 @@ pub fn save(cfg: Config) -> anyhow::Result<()> {
     }
     let body =
         toml::to_string_pretty(&cfg).with_context(|| "serializing config to TOML".to_string())?;
-    std::fs::write(&path, body)
-        .with_context(|| format!("writing config to {}", path.display()))?;
+
+    let tmp_path = path.with_extension("toml.tmp");
+    std::fs::write(&tmp_path, &body)
+        .with_context(|| format!("writing temp config to {}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, &path).with_context(|| {
+        format!(
+            "rename {} -> {}",
+            tmp_path.display(),
+            path.display()
+        )
+    })?;
     log::info!("Saved config to {}", path.display());
 
     let lock = CONFIG.get_or_init(|| RwLock::new(Config::default()));

@@ -17,6 +17,10 @@ pub struct SettingsForm {
     pub resize_increment: String,
     pub ignored_processes: Vec<String>,
     pub ignored_classes: Vec<String>,
+    /// Per-window persistent ignores. Editable from the settings UI so
+    /// users can review and remove rules they previously added via Win+I
+    /// or the overview right-click menu.
+    pub ignored_window_titles: Vec<config::IgnoredWindowTitle>,
     pub new_process: String,
     pub new_class: String,
     pub status: Option<String>,
@@ -49,6 +53,7 @@ pub enum SettingsMessage {
     AddClass,
     AddClassByName(String),
     RemoveClass(usize),
+    RemoveIgnoredWindow(usize),
     ReloadFromDisk,
     Save,
     Close,
@@ -64,6 +69,7 @@ impl SettingsForm {
             resize_increment: cfg.tiling.resize_increment.to_string(),
             ignored_processes: cfg.filter.ignored_processes.clone(),
             ignored_classes: cfg.filter.ignored_classes.clone(),
+            ignored_window_titles: cfg.filter.ignored_window_titles.clone(),
             new_process: String::new(),
             new_class: String::new(),
             status: None,
@@ -105,13 +111,7 @@ impl SettingsForm {
             filter: config::FilterConfig {
                 ignored_processes: self.ignored_processes.clone(),
                 ignored_classes: self.ignored_classes.clone(),
-                // The settings UI doesn't yet expose per-window ignores;
-                // preserve any that the overview right-click added so we
-                // don't drop them on Save.
-                ignored_window_titles: config::current()
-                    .filter
-                    .ignored_window_titles
-                    .clone(),
+                ignored_window_titles: self.ignored_window_titles.clone(),
             },
             api,
             monitors,
@@ -166,17 +166,21 @@ pub fn update(form: &mut SettingsForm, message: SettingsMessage) -> bool {
                 form.ignored_classes.remove(i);
             }
         }
+        SettingsMessage::RemoveIgnoredWindow(i) => {
+            if i < form.ignored_window_titles.len() {
+                form.ignored_window_titles.remove(i);
+            }
+        }
         SettingsMessage::ReloadFromDisk => {
             if let Err(e) = config::reload() {
                 form.status = Some(format!("Reload failed: {e:#}"));
             } else {
-                // Re-read config but keep the captured window snapshot — those
-                // are the currently-tiled windows, not a config field.
                 let cfg = config::current();
                 form.padding = cfg.tiling.padding.to_string();
                 form.resize_increment = cfg.tiling.resize_increment.to_string();
                 form.ignored_processes = cfg.filter.ignored_processes.clone();
                 form.ignored_classes = cfg.filter.ignored_classes.clone();
+                form.ignored_window_titles = cfg.filter.ignored_window_titles.clone();
                 form.new_process.clear();
                 form.new_class.clear();
                 form.status = Some("Reloaded from disk.".into());
@@ -246,6 +250,7 @@ pub fn view(form: &SettingsForm) -> Element<'_, app::Message> {
     );
 
     let current_section = current_windows_section(form);
+    let per_window_section = ignored_windows_section(form);
 
     let status_line: Element<'_, app::Message> = if let Some(msg_text) = &form.status {
         text(msg_text.as_str()).size(13).into()
@@ -272,6 +277,7 @@ pub fn view(form: &SettingsForm) -> Element<'_, app::Message> {
         current_section,
         processes_section,
         classes_section,
+        per_window_section,
         status_line,
         actions,
     ]
@@ -368,6 +374,53 @@ fn current_windows_section(form: &SettingsForm) -> Element<'_, app::Message> {
             row![info_column, exe_button, class_button]
                 .spacing(8)
                 .align_y(iced::Alignment::Center),
+        );
+    }
+
+    column![header, hint, list].spacing(8).into()
+}
+
+fn ignored_windows_section(form: &SettingsForm) -> Element<'_, app::Message> {
+    let header = text("Ignored windows (per-window)").size(16);
+    let hint = text(
+        "Specific windows ignored by (process, title, class). Added via Win+I or the overview's \
+         right-click \u{2192} \u{201C}Ignore this window\u{201D}.",
+    )
+    .size(11);
+
+    if form.ignored_window_titles.is_empty() {
+        return column![header, hint, text("(none)").size(12)]
+            .spacing(8)
+            .into();
+    }
+
+    let mut list = column![].spacing(4);
+    for (i, entry) in form.ignored_window_titles.iter().enumerate() {
+        let class_str = entry
+            .class
+            .as_deref()
+            .map_or_else(|| "(any class)".to_string(), |c| format!("class={c}"));
+        let title_str = if entry.title.is_empty() {
+            "(empty title)".to_string()
+        } else {
+            entry.title.clone()
+        };
+
+        let info = column![
+            text(format!("{}  \u{2022}  {}", entry.process, class_str)).size(12),
+            text(title_str).size(11),
+        ]
+        .spacing(2)
+        .width(Length::Fill);
+
+        list = list.push(
+            row![
+                info,
+                button(text("\u{00D7}").size(13))
+                    .on_press(msg(SettingsMessage::RemoveIgnoredWindow(i))),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
         );
     }
 

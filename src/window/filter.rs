@@ -52,7 +52,7 @@ pub fn should_be_tiled(window: Window) -> anyhow::Result<bool> {
     let user_cfg = config::current();
     filter_out_if!(user_cfg.filter.ignored_classes.iter().any(|c| c == &class));
     filter_out_if!(user_cfg.filter.ignored_processes.iter().any(|p| p == &process));
-    // Per-window persistent ignore: process + exact title match.
+    // Per-window persistent ignore: (process, title, optional class) match.
     let title_str = window
         .title()
         .ok()
@@ -63,7 +63,9 @@ pub fn should_be_tiled(window: Window) -> anyhow::Result<bool> {
             .filter
             .ignored_window_titles
             .iter()
-            .any(|e| e.process == process && e.title == title_str)
+            .any(|e| e.process == process
+                && e.title == title_str
+                && e.class.as_deref().map_or(true, |c| c == class.as_str()))
     );
     drop(user_cfg);
 

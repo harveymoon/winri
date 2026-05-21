@@ -153,17 +153,24 @@ impl app::State {
         }))
     }
 
-    pub fn handle_overview_message(&mut self, message: Message) -> anyhow::Result<()> {
+    pub fn handle_overview_message(&mut self, message: Message) -> anyhow::Result<Task<app::Message>> {
         match message {
             Message::OverviewWindowCreated {
                 id,
                 raw_handle,
                 hmonitor,
-            } => {
-                self.finalize_open_overview(id, raw_handle, hmonitor)?;
-            }
+            } => match self.finalize_open_overview(id, raw_handle, hmonitor) {
+                Ok(()) => Ok(Task::none()),
+                Err(e) => {
+                    // The overview window was opened before finalize ran, so
+                    // failing here would orphan it. Close it explicitly so
+                    // the user doesn't end up with an empty transparent
+                    // window stuck on screen.
+                    log::warn!("Overview finalize failed; closing orphan window: {e:#}");
+                    Ok(iced::window::close::<app::Message>(id))
+                }
+            },
         }
-        Ok(())
     }
 
     fn finalize_open_overview(
@@ -205,7 +212,7 @@ impl app::State {
         // dragged them; we partition those by their actual current monitor.
         let tiling_hmonitor_now = self.tiling_hmonitor();
         let mut on_this_monitor: Vec<Window> = Vec::new();
-        if hmonitor == tiling_hmonitor_now {
+        if Some(hmonitor) == tiling_hmonitor_now {
             for item in self.tiler.windows() {
                 on_this_monitor.push(item.inner);
             }
@@ -265,7 +272,7 @@ impl app::State {
         // Tiling monitor keeps the horizontal-strip overview (preserves
         // drag-reorder semantics). Floating monitors get a wrapping grid
         // that adapts to the monitor's aspect ratio.
-        let is_tiling_monitor = hmonitor == self.tiling_hmonitor();
+        let is_tiling_monitor = Some(hmonitor) == self.tiling_hmonitor();
         let layouts = if is_tiling_monitor {
             thumbnail::compute_thumbnail_layouts(&window_data, monitor_size, 10.0)
         } else {
@@ -408,6 +415,19 @@ impl app::State {
 
     pub fn handle_overview_mouse_pressed(&mut self, window_id: iced::window::Id) {
         if let Some(monitor) = self.overview_monitor_for_window_mut(window_id) {
+            // If the right-click context menu is open, the left-click that
+            // triggered this is either targeting a menu button (the
+            // button's on_press fires the action and dismisses the menu)
+            // or clicking outside to dismiss. Don't record press_pos —
+            // by the time the matching mouse-up arrives the menu may
+            // already be dismissed, and the release-outcome check would
+            // otherwise misinterpret the gesture as click-to-jump or
+            // drag-to-reorder.
+            if monitor.context_menu.is_some() {
+                monitor.press_pos = None;
+                monitor.drag_source_idx = None;
+                return;
+            }
             monitor.press_pos = monitor.cursor_pos;
             monitor.drag_source_idx = monitor.cursor_pos.and_then(|p| monitor.thumbnail_at(p));
         }
@@ -552,30 +572,33 @@ impl app::State {
             .context("invalid HWND for Ignore window")?;
         let process = target.process_name().unwrap_or_default();
         let title = target.title().ok().flatten().unwrap_or_default();
-        if process.is_empty() || title.is_empty() {
-            log::warn!(
-                "Ignore window: missing process={process:?} or title={title:?}; skipping persist"
-            );
+        let class = target.class().unwrap_or_default();
+        if process.is_empty() {
+            log::warn!("Ignore window: missing process; skipping persist");
             self.dismiss_overview_context_menu();
             return Ok(());
         }
 
+        let class_opt = if class.is_empty() { None } else { Some(class.clone()) };
         let mut cfg = crate::config::current().clone();
-        let already = cfg
-            .filter
-            .ignored_window_titles
-            .iter()
-            .any(|e| e.process == process && e.title == title);
+        let already = cfg.filter.ignored_window_titles.iter().any(|e| {
+            e.process == process
+                && e.title == title
+                && e.class.as_deref() == class_opt.as_deref()
+        });
         if !already {
             cfg.filter
                 .ignored_window_titles
                 .push(crate::config::IgnoredWindowTitle {
                     process: process.clone(),
                     title: title.clone(),
+                    class: class_opt.clone(),
                 });
             crate::config::save(cfg)
                 .context("saving config after Ignore window from overview menu")?;
-            log::info!("Overview menu: ignoring window process={process} title={title:?}");
+            log::info!(
+                "Overview menu: ignoring window process={process} class={class:?} title={title:?}"
+            );
         }
         self.dismiss_overview_context_menu();
         Ok(())
@@ -623,7 +646,9 @@ impl app::State {
         let layouts =
             thumbnail::compute_thumbnail_layouts(&windows, self.tiler.screen_size(), 10.0);
 
-        let tiling_hmonitor = self.tiling_hmonitor();
+        let Some(tiling_hmonitor) = self.tiling_hmonitor() else {
+            return Ok(());
+        };
         let Mode::Overview(state) = &mut self.mode else {
             return Ok(());
         };

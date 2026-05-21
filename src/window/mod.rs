@@ -38,6 +38,101 @@ pub struct Window {
     pub hwnd: SafeHWND,
 }
 
+/// One target rect for a batched window move (in screen pixels, already
+/// padded for DWM frame).
+#[derive(Debug, Clone, Copy)]
+pub struct BatchMove {
+    pub hwnd: HWND,
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+/// Move many windows via `BeginDeferWindowPos` / `EndDeferWindowPos`.
+///
+/// Two layers of defense against the all-or-nothing failure mode that
+/// stranded windows offscreen in earlier builds:
+///
+/// 1. **Pre-validate**: every HWND is `IsWindow`-checked before being
+///    added to the batch. Stale handles from windows that closed between
+///    enumeration and the move are dropped silently.
+///
+/// 2. **Best-effort fallback per move**: if `DeferWindowPos` errors on a
+///    particular move, the HDWP becomes invalid. We commit what was
+///    already queued (so the prior valid moves DO apply), then issue
+///    per-window `SetWindowPos` calls for the remainder with the same
+///    flags. One bad window can no longer drag every other window down
+///    with it.
+///
+/// Flags applied: `SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOSENDCHANGING |
+/// SWP_DEFERERASE | SWP_ASYNCWINDOWPOS` so a hung target app can't block
+/// the move and we skip the `WM_WINDOWPOSCHANGING` round-trip.
+pub fn batch_move_windows(moves: &[BatchMove]) -> anyhow::Result<()> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, HDWP, IsWindow, SetWindowPos,
+        SWP_ASYNCWINDOWPOS, SWP_DEFERERASE, SWP_NOACTIVATE, SWP_NOSENDCHANGING, SWP_NOZORDER,
+    };
+
+    // Filter stale HWNDs up front so DeferWindowPos doesn't trip over them.
+    let validated: Vec<&BatchMove> = moves
+        .iter()
+        .filter(|mv| unsafe { IsWindow(Some(mv.hwnd)) }.as_bool())
+        .collect();
+    if validated.is_empty() {
+        return Ok(());
+    }
+
+    let flags = SWP_NOACTIVATE
+        | SWP_NOZORDER
+        | SWP_NOSENDCHANGING
+        | SWP_DEFERERASE
+        | SWP_ASYNCWINDOWPOS;
+
+    let mut hdwp: HDWP = unsafe {
+        BeginDeferWindowPos(i32::try_from(validated.len()).unwrap_or(i32::MAX))
+    }
+    .context("BeginDeferWindowPos")?;
+
+    // Track where we got to so we can fall back per-window from there.
+    let mut failed_at: Option<usize> = None;
+    for (i, mv) in validated.iter().enumerate() {
+        match unsafe {
+            DeferWindowPos(hdwp, mv.hwnd, None, mv.x, mv.y, mv.width, mv.height, flags)
+        } {
+            Ok(updated) => hdwp = updated,
+            Err(e) => {
+                log::warn!(
+                    "DeferWindowPos failed for HWND {:?} ({e}); committing prior moves and falling back per-window",
+                    mv.hwnd
+                );
+                failed_at = Some(i);
+                break;
+            }
+        }
+    }
+
+    // Commit whatever we successfully queued. If the loop broke we still
+    // pass the HDWP returned by the last successful DeferWindowPos — it
+    // contains the valid earlier moves.
+    let _ = unsafe { EndDeferWindowPos(hdwp) };
+
+    // For the failed move and everything after, fall back to per-window
+    // SetWindowPos. Same flags — a bad window just gets logged and
+    // skipped without affecting the rest.
+    if let Some(start) = failed_at {
+        for mv in &validated[start..] {
+            if let Err(e) = unsafe {
+                SetWindowPos(mv.hwnd, None, mv.x, mv.y, mv.width, mv.height, flags)
+            } {
+                log::warn!("Per-window SetWindowPos fallback failed for {:?}: {e}", mv.hwnd);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 impl Hash for Window {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         format!("{:?}", self.hwnd).hash(state);
@@ -103,6 +198,14 @@ impl Window {
     /// is comparable across threads. Cheap (~microseconds).
     pub fn monitor(self) -> isize {
         crate::monitor::monitor_of_hwnd(self.handle())
+    }
+
+    /// `true` if the window is currently minimized to the taskbar. Used
+    /// by the tiler to skip layout for minimized windows so the user's
+    /// minimize gesture sticks.
+    pub fn is_iconic(self) -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::IsIconic;
+        unsafe { IsIconic(self.handle()) }.as_bool()
     }
 
     pub fn enumerate() -> anyhow::Result<Vec<Self>> {
@@ -275,6 +378,20 @@ impl Window {
         Ok(())
     }
 
+    /// DWM-frame-padded target rect for this window if it were placed at
+    /// `(pos, size)`. Pulled out of `move_to` so the batched-move path can
+    /// use the same math without re-doing it.
+    pub fn padded_rect(self, pos: Position, size: Size) -> anyhow::Result<(i32, i32, i32, i32)> {
+        ensure_valid!(self);
+        let [left, top, right, bottom] = self.padding()?;
+        Ok((
+            (pos.x() - left) as i32,
+            (pos.y() - top) as i32,
+            (size.width() + right + left) as i32,
+            (size.height() + bottom + top) as i32,
+        ))
+    }
+
     pub fn set_no_activate(self) -> anyhow::Result<()> {
         ensure_valid!(self);
         #[allow(
@@ -326,11 +443,36 @@ impl Window {
     }
 
     /// Clear any previously-applied clipping region — the whole window is
-    /// rendered again.
+    /// rendered again. Also forces DWM to re-evaluate the non-client area:
+    /// `SetWindowRgn` makes DWM drop the modern Aero/acrylic frame, and
+    /// `SetWindowRgn(NULL)` alone doesn't always bring it back. The
+    /// follow-up `SetWindowPos(SWP_FRAMECHANGED)` call signals "frame
+    /// shape changed" which makes DWM rebuild the modern frame.
     pub fn clear_visible_region(self) -> anyhow::Result<()> {
         ensure_valid!(self);
-        use windows::Win32::Graphics::Gdi::SetWindowRgn;
+        use windows::Win32::{
+            Graphics::Gdi::SetWindowRgn,
+            UI::WindowsAndMessaging::{
+                SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+                SetWindowPos,
+            },
+        };
         let _ = unsafe { SetWindowRgn(self.handle(), None, true) };
+        let _ = unsafe {
+            SetWindowPos(
+                self.handle(),
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE
+                    | SWP_NOSIZE
+                    | SWP_NOZORDER
+                    | SWP_NOACTIVATE
+                    | SWP_FRAMECHANGED,
+            )
+        };
         Ok(())
     }
 

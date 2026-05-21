@@ -234,33 +234,47 @@ impl State {
         }
     }
 
-    /// Persist the currently-focused window's class name to
-    /// `filter.ignored_classes`. Used by Win+I to silence transient
-    /// popups (e.g. TouchDesigner's Op Create Dialog) that auto-dismiss
-    /// on mouse-click, where the overview right-click flow can't reach
-    /// them. Class is preferred over title because popup titles change
-    /// or are blank, but the class is stable.
+    /// Persist the currently-focused window as a (process, class, title)
+    /// triple in `filter.ignored_window_titles`. Used by Win+I to silence
+    /// transient popups (e.g. TouchDesigner's Op Create Dialog) that
+    /// auto-dismiss on mouse-click, so the overview right-click flow can't
+    /// reach them. All three fields must match for filtering, so a popup
+    /// sharing a class with its app's main window stays specific.
     pub fn ignore_focused_window_by_class(&mut self) -> anyhow::Result<()> {
         let focused = window::Window::focused().context("getting focused window")?;
         let class = focused.class().context("reading focused window class")?;
         let process = focused.process_name().unwrap_or_default();
         let title = focused.title().ok().flatten().unwrap_or_default();
 
-        if class.is_empty() {
-            log::warn!("Ignore focused window: class empty, skipping");
+        if process.is_empty() || class.is_empty() {
+            log::warn!(
+                "Ignore focused window: process or class empty (process={process:?}, class={class:?}); skipping"
+            );
             return Ok(());
         }
 
         let mut cfg = config::current().clone();
-        let already = cfg.filter.ignored_classes.iter().any(|c| c == &class);
+        let already = cfg.filter.ignored_window_titles.iter().any(|e| {
+            e.process == process
+                && e.title == title
+                && e.class.as_deref() == Some(class.as_str())
+        });
         if !already {
-            cfg.filter.ignored_classes.push(class.clone());
+            cfg.filter
+                .ignored_window_titles
+                .push(config::IgnoredWindowTitle {
+                    process: process.clone(),
+                    title: title.clone(),
+                    class: Some(class.clone()),
+                });
             config::save(cfg).context("saving config after Ignore focused window")?;
             log::info!(
-                "Ignore focused window: added class {class:?} (process={process:?}, title={title:?})"
+                "Ignore focused window: persisted process={process:?} class={class:?} title={title:?}"
             );
         } else {
-            log::info!("Ignore focused window: class {class:?} already in ignored_classes");
+            log::info!(
+                "Ignore focused window: entry for process={process:?} class={class:?} title={title:?} already exists"
+            );
         }
         Ok(())
     }
@@ -347,10 +361,15 @@ impl State {
                 system::restore_windows();
                 return iced::exit();
             }
-            Message::Overview(message) => self
-                .handle_overview_message(message)
-                .handle_faillible_process()
-                .discard(),
+            Message::Overview(message) => {
+                if let Ok(overview_task) = self
+                    .handle_overview_message(message)
+                    .context("overview message")
+                    .handle_faillible_process()
+                {
+                    task = task.chain(overview_task);
+                }
+            }
             Message::Action(action) => {
                 if let Ok(action_task) = self
                     .handle_action(action)

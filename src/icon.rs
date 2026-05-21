@@ -12,7 +12,7 @@ use windows::Win32::{
     },
     UI::WindowsAndMessaging::{
         GCLP_HICON, GCLP_HICONSM, GET_CLASS_LONG_INDEX, GetClassLongPtrW, GetIconInfo, HICON,
-        ICONINFO, SendMessageW,
+        ICONINFO, SMTO_ABORTIFHUNG, SendMessageTimeoutW,
     },
 };
 
@@ -20,17 +20,35 @@ const WM_GETICON: u32 = 0x007F;
 const ICON_SMALL: usize = 0;
 const ICON_BIG: usize = 1;
 const ICON_SMALL2: usize = 2;
+/// How long to wait for a window's WM_GETICON response before giving up.
+/// `SMTO_ABORTIFHUNG` means a hung target returns immediately; this is the
+/// upper bound for a *non-hung but slow* response.
+const ICON_RESPONSE_TIMEOUT_MS: u32 = 80;
 
 /// Try the standard sources of a window's icon, in quality-descending
 /// order. Returns the first non-null HICON, or None if none of them are
 /// available (e.g. UWP host windows, system console).
+///
+/// Uses `SendMessageTimeoutW` with `SMTO_ABORTIFHUNG` so a frozen target
+/// app can't block winri's event loop. `GetClassLongPtrW` is a non-
+/// message query (kernel state lookup), so it doesn't need the timeout
+/// dance.
 fn fetch_hicon(hwnd_raw: u64) -> Option<HICON> {
     let hwnd = HWND(hwnd_raw as *mut c_void);
     unsafe {
         for icon_type in [ICON_SMALL2, ICON_SMALL, ICON_BIG] {
-            let r = SendMessageW(hwnd, WM_GETICON, Some(WPARAM(icon_type)), Some(LPARAM(0)));
-            if r.0 != 0 {
-                return Some(HICON(r.0 as *mut c_void));
+            let mut result: usize = 0;
+            let lresult = SendMessageTimeoutW(
+                hwnd,
+                WM_GETICON,
+                WPARAM(icon_type),
+                LPARAM(0),
+                SMTO_ABORTIFHUNG,
+                ICON_RESPONSE_TIMEOUT_MS,
+                Some(&raw mut result),
+            );
+            if lresult.0 != 0 && result != 0 {
+                return Some(HICON(result as *mut c_void));
             }
         }
         for nindex in [GCLP_HICONSM, GCLP_HICON] {

@@ -112,6 +112,10 @@ impl ScrollTiler {
             resize_increment,
             screen_size,
             smooth_scroll_factor: 0.25,
+            // Seed from the actual key state so a mouse that's already
+            // held when winri starts doesn't trigger a spurious drag-end
+            // on the very first snapshot.
+            was_mouse_held_last_snapshot: is_left_mouse_held(),
             ..Default::default()
         }
     }
@@ -594,14 +598,38 @@ impl ScrollTiler {
         const PARK_X: f32 = 100_000.0;
         const PARK_Y: f32 = 100_000.0;
 
-        let mut moved_any = false;
-        for (window, x) in self.windows.iter_mut().zip(windows_positions) {
+        // Per-frame decision for each window: what rect to move it to,
+        // whether to apply a clip, and what clip rect. We compute these
+        // first, then issue a *single* batched `BeginDeferWindowPos` to
+        // move them all in one DWM composition pass, and finally apply
+        // clip changes (only when not animating — clipping is expensive
+        // and we'd rather catch up at settle than fight DWM 60×/sec).
+        struct Decision {
+            idx: usize,
+            place_x: f32,
+            place_y: f32,
+            target_w: f32,
+            target_h: f32,
+            // None = fully visible (no clip needed)
+            // Some((l,t,r,b)) = partial overflow, set clip
+            // The "fully offscreen" case is encoded by parking + None
+            // (no clip needed since the window is parked at PARK_X/Y).
+            clip: Option<(i32, i32, i32, i32)>,
+            fully_offscreen: bool,
+        }
+
+        let animating = self.scroll_target.is_some();
+        let mut decisions: Vec<Decision> = Vec::with_capacity(self.windows.len());
+
+        for (idx, (window, x)) in self.windows.iter().zip(windows_positions).enumerate() {
+            if window.inner.is_iconic() {
+                continue;
+            }
             let target_x = x - self.scroll_offset;
             let target_y = self.padding;
             let target_height = self.padding.mul_add(-2.0, self.screen_size.height());
             let target_width = window.width;
 
-            // Screen-space intersection with the tiling monitor.
             let vis_left = target_x.max(0.0);
             let vis_top = target_y.max(0.0);
             let vis_right = (target_x + target_width).min(monitor_width);
@@ -612,87 +640,119 @@ impl ScrollTiler {
                 && target_x + target_width <= monitor_width
                 && target_y + target_height <= monitor_height;
 
-            // Decide where to physically place the window. Fully-off windows
-            // get parked at far coords so they don't render on any monitor.
             let (place_x, place_y) = if fully_offscreen {
                 (PARK_X, PARK_Y)
             } else {
                 (target_x, target_y)
             };
 
-            let changed = window
-                .last_layout
-                .map_or(true, |(px, py, pw, ph)| {
-                    (px - place_x).abs() > MOTION_EPS
-                        || (py - place_y).abs() > MOTION_EPS
-                        || (pw - target_width).abs() > MOTION_EPS
-                        || (ph - target_height).abs() > MOTION_EPS
-                });
+            let clip = if fully_offscreen || fully_visible {
+                None
+            } else {
+                #[allow(clippy::cast_possible_truncation)]
+                let l = (vis_left - target_x) as i32;
+                #[allow(clippy::cast_possible_truncation)]
+                let t = (vis_top - target_y) as i32;
+                #[allow(clippy::cast_possible_truncation)]
+                let r = (vis_right - target_x) as i32;
+                #[allow(clippy::cast_possible_truncation)]
+                let b = (vis_bottom - target_y) as i32;
+                Some((l, t, r, b))
+            };
 
-            if let Err(e) = window.inner.move_to(
-                [place_x, place_y].into(),
-                [target_width, target_height].into(),
-            ) {
-                warn!(
-                    "Error while layouting window, skipping to next one (window might have been closed just after enumeration): {e}"
-                );
+            decisions.push(Decision {
+                idx,
+                place_x,
+                place_y,
+                target_w: target_width,
+                target_h: target_height,
+                clip,
+                fully_offscreen,
+            });
+        }
+
+        // Build the batch — skip windows that haven't drifted past
+        // `MOTION_EPS` from their last laid-out rect.
+        let mut batch: Vec<crate::window::BatchMove> = Vec::with_capacity(decisions.len());
+        let mut moved_any = false;
+        for d in &decisions {
+            let item = &self.windows[d.idx];
+            let changed = item.last_layout.map_or(true, |(px, py, pw, ph)| {
+                (px - d.place_x).abs() > MOTION_EPS
+                    || (py - d.place_y).abs() > MOTION_EPS
+                    || (pw - d.target_w).abs() > MOTION_EPS
+                    || (ph - d.target_h).abs() > MOTION_EPS
+            });
+            if !changed {
                 continue;
             }
-            if changed {
-                moved_any = true;
-                window.last_layout = Some((place_x, place_y, target_width, target_height));
+            moved_any = true;
+            match item.inner.padded_rect(
+                [d.place_x, d.place_y].into(),
+                [d.target_w, d.target_h].into(),
+            ) {
+                Ok((x, y, w, h)) => batch.push(crate::window::BatchMove {
+                    hwnd: item.inner.handle(),
+                    x,
+                    y,
+                    width: w,
+                    height: h,
+                }),
+                Err(e) => warn!("padded_rect failed during layout: {e}"),
             }
+        }
 
-            // Clip the rendered region so off-monitor pixels don't show up
-            // on a neighbouring screen. State changes are logged so any
-            // weirdness is easy to diagnose.
-            if fully_offscreen {
-                // Parked windows don't need a clip — they're already off
-                // every monitor. Make sure any prior clip is removed.
-                if window.last_clip.is_some() {
-                    if let Err(e) = window.inner.clear_visible_region() {
-                        warn!("clear_visible_region (park transition) failed: {e}");
-                    }
-                    log::debug!("clip: {:?} parked, cleared region", window.inner.handle());
-                    window.last_clip = None;
+        if let Err(e) = crate::window::batch_move_windows(&batch) {
+            warn!("batch_move_windows failed; falling back to per-window moves: {e}");
+            for d in &decisions {
+                let item = &self.windows[d.idx];
+                if let Err(e2) = item.inner.move_to(
+                    [d.place_x, d.place_y].into(),
+                    [d.target_w, d.target_h].into(),
+                ) {
+                    warn!("per-window move_to fallback failed: {e2}");
                 }
-            } else if fully_visible {
-                if window.last_clip.is_some() {
-                    if let Err(e) = window.inner.clear_visible_region() {
-                        warn!("clear_visible_region (fully-visible transition) failed: {e}");
-                    }
-                    log::debug!(
-                        "clip: {:?} fully visible, cleared region",
-                        window.inner.handle()
-                    );
-                    window.last_clip = None;
-                }
-            } else {
-                // Partial overflow — clip to the visible window-local rect.
-                #[allow(clippy::cast_possible_truncation)]
-                let local_left = (vis_left - target_x) as i32;
-                #[allow(clippy::cast_possible_truncation)]
-                let local_top = (vis_top - target_y) as i32;
-                #[allow(clippy::cast_possible_truncation)]
-                let local_right = (vis_right - target_x) as i32;
-                #[allow(clippy::cast_possible_truncation)]
-                let local_bottom = (vis_bottom - target_y) as i32;
-                let next_clip = (local_left, local_top, local_right, local_bottom);
+            }
+        }
 
-                if window.last_clip != Some(next_clip) {
-                    if let Err(e) = window.inner.set_visible_region(
-                        local_left,
-                        local_top,
-                        local_right,
-                        local_bottom,
-                    ) {
-                        warn!("set_visible_region failed: {e}");
-                    } else {
-                        log::debug!(
-                            "clip: {:?} partial -> ({local_left}, {local_top}, {local_right}, {local_bottom})",
-                            window.inner.handle()
-                        );
-                        window.last_clip = Some(next_clip);
+        // Update last_layout for every window we just decided on (even
+        // those we skipped via the eps gate — they're still at the
+        // expected rect).
+        for d in &decisions {
+            self.windows[d.idx].last_layout =
+                Some((d.place_x, d.place_y, d.target_w, d.target_h));
+        }
+
+        // Clip pass. Skip entirely while animating: SetWindowRgn forces a
+        // per-call DWM frame redraw, which dominates the per-tick cost
+        // for apps with custom title bars. We accept transient pixel
+        // spillover during the slide and re-apply clips on the next
+        // non-animating layout (which runs once the animation settles).
+        if !animating {
+            for d in &decisions {
+                let item = &mut self.windows[d.idx];
+                if d.fully_offscreen {
+                    if item.last_clip.is_some() {
+                        if let Err(e) = item.inner.clear_visible_region() {
+                            warn!("clear_visible_region (park transition) failed: {e}");
+                        }
+                        item.last_clip = None;
+                    }
+                } else if d.clip.is_none() {
+                    if item.last_clip.is_some() {
+                        if let Err(e) = item.inner.clear_visible_region() {
+                            warn!("clear_visible_region (fully-visible transition) failed: {e}");
+                        }
+                        item.last_clip = None;
+                    }
+                } else if let Some(next_clip) = d.clip {
+                    if item.last_clip != Some(next_clip) {
+                        let (l, t, r, b) = next_clip;
+                        if let Err(e) = item.inner.set_visible_region(l, t, r, b) {
+                            warn!("set_visible_region failed: {e}");
+                        } else {
+                            item.last_clip = Some(next_clip);
+                        }
                     }
                 }
             }

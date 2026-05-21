@@ -74,25 +74,26 @@ impl app::State {
         let initial_pass = self.pending_initial_consolidation;
         if initial_pass {
             log::info!(
-                "Initial consolidation: tiling every managed window onto monitor {tiling_hmonitor}"
+                "Initial consolidation: tiling every managed window (target monitor {tiling_hmonitor:?})"
             );
             self.pending_initial_consolidation = false;
         }
 
         log::info!("Snapshot: {:?}", get_process_names(&windows_snapshot));
 
-        // For the initial consolidation we pass a synthetic hmonitor of 0
-        // for the add-gate; that means the gate compares each window's
-        // monitor against 0, but we want EVERY window to be added. So for
-        // the initial pass we feed the tiler a sentinel that matches all
-        // windows by querying their own monitor in turn — easier: add a
-        // dedicated initial-bulk path below.
         if initial_pass {
             // Force-add every window in the snapshot regardless of monitor.
             self.tiler.bulk_seed(&windows_snapshot);
+        } else if let Some(target) = tiling_hmonitor {
+            self.tiler.handle_window_snapshot(&windows_snapshot, target);
         } else {
-            self.tiler
-                .handle_window_snapshot(&windows_snapshot, tiling_hmonitor);
+            // No tiling monitor resolvable right now (config points at an
+            // unplugged display, or no monitors). Skip the monitor-gated
+            // snapshot — windows currently tiled stay tiled, but we don't
+            // auto-add new ones or auto-untile based on monitor.
+            log::warn!(
+                "tiling_monitor unresolved; skipping monitor-gated snapshot pass"
+            );
         }
 
         self.update_tiler_border()?;
@@ -102,18 +103,19 @@ impl app::State {
         Ok(())
     }
 
-    /// Cached `HMONITOR` of the configured tiling monitor. Falls back to
-    /// the primary monitor if the configured one isn't currently attached.
-    /// Cheap (~tens of microseconds) — re-resolved on every tiler tick so
-    /// hot-plug Just Works without needing display-change events.
-    pub(crate) fn tiling_hmonitor(&self) -> isize {
+    /// Resolves the configured tiling monitor each tick. `None` means
+    /// either no monitor is attached or the config value points at a
+    /// monitor that isn't currently present — callers should skip
+    /// monitor-gated behaviour (rather than fall through to comparing
+    /// against a sentinel that nukes the tiler).
+    pub(crate) fn tiling_hmonitor(&self) -> Option<isize> {
         let cfg_value = {
             let cfg = crate::config::current();
             cfg.monitors.tiling_monitor.clone()
         };
         crate::monitor::resolve_tiling_monitor(&cfg_value)
+            .ok()
             .map(|m| m.hmonitor)
-            .unwrap_or(0)
     }
 
     /// Push the latest tiler view to the API state so `/state` and `/windows`
@@ -123,11 +125,14 @@ impl app::State {
         let screen = self.tiler.screen_size();
         let tiling_hmonitor = self.tiling_hmonitor();
         let all_monitors = crate::monitor::enumerate();
-        let tiling_device_name = all_monitors
-            .iter()
-            .find(|m| m.hmonitor == tiling_hmonitor)
-            .map(|m| m.device_name.clone())
-            .unwrap_or_default();
+        let tiling_device_name = match tiling_hmonitor {
+            Some(h) => all_monitors
+                .iter()
+                .find(|m| m.hmonitor == h)
+                .map(|m| m.device_name.clone())
+                .unwrap_or_default(),
+            None => String::new(),
+        };
 
         let monitor_lookup = |hmon: isize| -> String {
             all_monitors
@@ -199,7 +204,7 @@ impl app::State {
                 index: i,
                 device_name: m.device_name.clone(),
                 is_primary: m.is_primary,
-                is_tiling: m.hmonitor == tiling_hmonitor,
+                is_tiling: Some(m.hmonitor) == tiling_hmonitor,
                 work_area_x: m.work_area.left,
                 work_area_y: m.work_area.top,
                 work_area_width: m.work_area_width(),

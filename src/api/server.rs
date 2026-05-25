@@ -80,6 +80,10 @@ fn handle_request(request: Request) -> anyhow::Result<()> {
             let id_str = &path["/windows/".len()..path.len() - "/resize".len()];
             handle_resize(request, id_str)
         }
+        (Method::Post, path) if path.starts_with("/windows/") && path.ends_with("/wake") => {
+            let id_str = &path["/windows/".len()..path.len() - "/wake".len()];
+            handle_wake(request, id_str)
+        }
         (Method::Get, path) if path.starts_with("/windows/") && path.ends_with("/thumbnail") => {
             let id_str = &path["/windows/".len()..path.len() - "/thumbnail".len()];
             let max_width = query.as_deref().and_then(parse_width_param);
@@ -248,6 +252,14 @@ fn handle_move_to_monitor(mut request: Request, id_str: &str) -> anyhow::Result<
             device_name: req.device_name,
         },
     )
+}
+
+fn handle_wake(request: Request, id_str: &str) -> anyhow::Result<()> {
+    let hwnd: u64 = match id_str.parse() {
+        Ok(v) => v,
+        Err(_) => return respond_error(request, 400, "invalid window id"),
+    };
+    dispatch_command(request, ApiCommand::WakeWindow { hwnd })
 }
 
 fn handle_resize(mut request: Request, id_str: &str) -> anyhow::Result<()> {

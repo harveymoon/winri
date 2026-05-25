@@ -483,7 +483,62 @@ impl Window {
         use windows::Win32::{
             Graphics::Gdi::SetWindowRgn,
             UI::WindowsAndMessaging::{
-                SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+                SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+                SWP_NOZORDER, SetWindowPos,
+            },
+        };
+        let _ = unsafe { SetWindowRgn(self.handle(), None, true) };
+        // `SWP_ASYNCWINDOWPOS` decouples the frame-changed notification
+        // from the target's UI-thread cadence. Without it, clearing 14
+        // window clips simultaneously at scroll-animation start
+        // serializes 14 round-trips through each app's main thread
+        // (`SetWindowPos` blocks until the target processes the message).
+        // For Chrome with a busy GPU compositor, that backpressure can
+        // wedge the swap chain and leave the window blank until
+        // recreated.
+        let _ = unsafe {
+            SetWindowPos(
+                self.handle(),
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE
+                    | SWP_NOSIZE
+                    | SWP_NOZORDER
+                    | SWP_NOACTIVATE
+                    | SWP_FRAMECHANGED
+                    | SWP_ASYNCWINDOWPOS,
+            )
+        };
+        Ok(())
+    }
+
+    /// Best-effort "wake up the renderer" sequence for a window that's
+    /// stuck blank — typically a Chromium app whose GPU compositor
+    /// stopped producing frames after a flurry of SetWindowPos /
+    /// SetWindowRgn churn during scroll or overview transitions. Does:
+    ///
+    /// 1. `SetWindowRgn(NULL)` — clears any lingering clip region.
+    /// 2. `SetWindowPos(SWP_FRAMECHANGED)` — forces the target to
+    ///    re-evaluate its non-client area; for Chromium that usually
+    ///    triggers a swap-chain refresh.
+    /// 3. `RedrawWindow(RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW |
+    ///    RDW_ALLCHILDREN)` — invalidates and synchronously repaints
+    ///    the window and all children.
+    ///
+    /// Exposed via `POST /windows/<id>/wake` so external clients can
+    /// offer a one-click "unstick this window" affordance.
+    pub fn force_repaint(self) -> anyhow::Result<()> {
+        ensure_valid!(self);
+        use windows::Win32::{
+            Graphics::Gdi::{
+                InvalidateRect, RDW_ALLCHILDREN, RDW_FRAME, RDW_INVALIDATE, RDW_UPDATENOW,
+                RedrawWindow, SetWindowRgn,
+            },
+            UI::WindowsAndMessaging::{
+                SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER,
                 SetWindowPos,
             },
         };
@@ -500,7 +555,17 @@ impl Window {
                     | SWP_NOSIZE
                     | SWP_NOZORDER
                     | SWP_NOACTIVATE
-                    | SWP_FRAMECHANGED,
+                    | SWP_FRAMECHANGED
+                    | SWP_ASYNCWINDOWPOS,
+            )
+        };
+        let _ = unsafe { InvalidateRect(Some(self.handle()), None, true) };
+        let _ = unsafe {
+            RedrawWindow(
+                Some(self.handle()),
+                None,
+                None,
+                RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW | RDW_ALLCHILDREN,
             )
         };
         Ok(())

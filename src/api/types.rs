@@ -67,6 +67,12 @@ pub enum ApiCommand {
     /// Move the window with the given HWND to the monitor identified by
     /// device name (e.g. `\\.\DISPLAY2`).
     MoveToMonitor { hwnd: u64, device_name: String },
+    /// Best-effort "wake up the renderer" for the window with the given
+    /// HWND. Useful when an app's compositor has stopped producing
+    /// frames (e.g. a Chrome window goes blank but still receives
+    /// hover events). Clears any leftover clip, forces a frame change,
+    /// and triggers a synchronous repaint.
+    WakeWindow { hwnd: u64 },
     /// Smoothly resize the tile width for the window with the given HWND.
     /// `animate_ms == 0` snaps instantly. If `center` is true, scroll
     /// smoothly so the resized window ends up centered in the viewport.

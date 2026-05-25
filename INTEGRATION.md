@@ -219,6 +219,27 @@ with resize animations: a "fly to this thumbnail" gesture can be a single
 POST to `/scroll` with the target offset plus a POST to
 `/windows/<id>/resize` with `center: true`, both finishing together.
 
+### `POST /windows/{id}/wake`
+
+Best-effort "unstick this window" — runs a defensive repaint sequence
+(`SetWindowRgn(NULL)` → `SetWindowPos(SWP_FRAMECHANGED)` →
+`RedrawWindow(RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW |
+RDW_ALLCHILDREN)`). Use when a window's compositor has stopped producing
+frames but the HWND is still alive — most often a Chromium app that
+goes blank/dark-grey while still receiving hover events.
+
+```sh
+curl -X POST http://127.0.0.1:47812/windows/7405134/wake
+```
+
+No body. Returns `202` on dispatch. Idempotent — safe to call on any
+window even if it isn't stuck (no-op effect on a healthy compositor).
+
+A reasonable UX: bind this to a button in the dashboard, or call it
+automatically when your client suspects a window has gone blank (e.g.
+the thumbnail PNG from `/windows/{id}/thumbnail` comes back as a single
+solid color).
+
 ### `POST /windows/{id}/resize`
 
 Smoothly (or instantly) resize the tile width for a tiled window. The same

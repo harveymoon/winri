@@ -328,6 +328,19 @@ impl State {
                 Task::none()
             }
             ApiCommand::Action(named) => Task::done(Message::Action(named_action_to_action(named))),
+            ApiCommand::WakeWindow { hwnd } => {
+                match window::Window::from_safe_hwnd(hwnd) {
+                    Ok(target) => {
+                        if let Err(e) = target.force_repaint() {
+                            log::warn!("API WakeWindow({hwnd}) failed: {e:#}");
+                        } else {
+                            log::info!("API WakeWindow({hwnd}) — repaint sequence sent");
+                        }
+                    }
+                    Err(_) => log::warn!("API WakeWindow: invalid HWND {hwnd}"),
+                }
+                Task::none()
+            }
             ApiCommand::MoveToMonitor { hwnd, device_name } => {
                 if let Ok(target) = window::Window::from_safe_hwnd(hwnd) {
                     if let Err(e) = self.overview_action_move_to_monitor(target, device_name) {

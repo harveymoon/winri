@@ -825,15 +825,28 @@ impl ScrollTiler {
         // never re-issued the move.
         //
         // Catch every flavour of this: on every snapshot tick where the
-        // mouse isn't held, compare each non-iconic non-cloaked window's
-        // actual screen position against `last_layout`. If they differ
-        // by more than the noise floor AND the window has *moved since
-        // last tick*, invalidate `last_layout` so the next pass actually
-        // re-issues the SetWindowPos. The "moved since last tick" gate
-        // is critical: an app that persistently rejects our move (stuck
-        // divergent state) won't trigger a busy-loop of SetWindowPos
-        // every tick. We only act on the transition.
-        if !mouse_held_now {
+        // mouse isn't held AND no animation is running, compare each
+        // non-iconic non-cloaked window's actual screen position against
+        // `last_layout`. If they differ by more than the noise floor AND
+        // the window has *moved since last tick*, invalidate
+        // `last_layout` so the next pass actually re-issues the
+        // SetWindowPos.
+        //
+        // Skipping during animations matters: an animation tick at 60Hz
+        // updates `last_layout` to interpolated positions while Chrome
+        // (et al.) is still applying the previous frame's SetWindowPos.
+        // A snapshot landing mid-animation would see the lag, flag it as
+        // divergence, and pile a redundant SetWindowPos onto a target
+        // window's already-busy message queue. Compositors that fall
+        // behind on this can stop producing frames entirely (Chrome
+        // blank-window symptom). The divergence check is for restoring
+        // *settled* state, not chasing in-flight motion.
+        //
+        // The "moved since last tick" gate is critical: an app that
+        // persistently rejects our move (stuck divergent state) won't
+        // trigger a busy-loop of SetWindowPos every tick. We only act
+        // on the transition.
+        if !mouse_held_now && !self.is_animating() {
             const DIVERGENCE_PX: f32 = 5.0;
             const MOVEMENT_NOISE_PX: f32 = 1.0;
             for item in &mut self.windows {

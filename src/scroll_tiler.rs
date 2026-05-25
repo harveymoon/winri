@@ -23,6 +23,18 @@ pub struct WidthAnimation {
     pub duration: Duration,
 }
 
+/// Time-based scroll animation set by the API. Same shape as
+/// [`WidthAnimation`]; ticked in the same `tick_animation` pass with the
+/// same ease-out-cubic so composed resize+scroll calls (e.g. "fly the
+/// viewport to this thumbnail") feel coherent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScrollAnimation {
+    pub start_offset: f32,
+    pub target_offset: f32,
+    pub start_time: Instant,
+    pub duration: Duration,
+}
+
 /// Represents a window managed by the tiler.
 #[derive(PartialEq)]
 pub struct WindowItem {
@@ -107,11 +119,20 @@ pub struct ScrollTiler {
     resize_increment: f32,
     /// The current scroll offset. Used to scroll the tiler view horizontally.
     scroll_offset: f32,
-    /// When `Some`, smoothing is active: the tiler is animating
-    /// `scroll_offset` toward this value. Set by scroll/focus operations
-    /// while [`smooth_scroll_enabled`] is `true`. Cleared once the animation
-    /// settles.
+    /// When `Some`, exponential smoothing is active: the tiler is
+    /// animating `scroll_offset` toward this value at
+    /// `smooth_scroll_factor` per frame. Set by user-driven scroll
+    /// (Win+wheel, focus shifts) while [`smooth_scroll_enabled`] is
+    /// `true`. Cleared once the animation settles. Mutually exclusive
+    /// with [`scroll_animation`] — starting one clears the other.
     scroll_target: Option<f32>,
+    /// Time-based scroll animation driven by the HTTP API's
+    /// `/scroll {animate_ms: N}`. Independent of the exponential
+    /// smoothing path so callers (e.g. a tablet scrub bar streaming
+    /// pointermove targets) can fire-and-forget at a known duration
+    /// rather than rely on the config-tunable smoothing factor. Mutually
+    /// exclusive with [`scroll_target`].
+    scroll_animation: Option<ScrollAnimation>,
     /// Whether to animate scroll changes. Mirrors `tiling.smooth_scroll`.
     smooth_scroll_enabled: bool,
     /// Per-tick interpolation factor. Mirrors `tiling.smooth_scroll_factor`.
@@ -152,11 +173,13 @@ impl ScrollTiler {
     }
 
     /// Whether any smoothing animation is currently in progress —
-    /// scroll smoothing or any per-window width animation. Drives the
-    /// 16ms iced redraw subscription so `tick_animation` keeps firing
-    /// until everything settles.
+    /// exponential scroll smoothing, time-based scroll animation, or any
+    /// per-window width animation. Drives the 16ms iced redraw
+    /// subscription so `tick_animation` keeps firing until everything
+    /// settles.
     pub fn is_animating(&self) -> bool {
         self.scroll_target.is_some()
+            || self.scroll_animation.is_some()
             || self.windows.iter().any(|w| w.width_animation.is_some())
     }
 
@@ -218,8 +241,24 @@ impl ScrollTiler {
     pub fn tick_animation(&mut self) -> bool {
         let mut moved = false;
 
-        // Scroll smoothing.
-        if let Some(target) = self.scroll_target {
+        // Time-based scroll animation (API-driven, ease-out-cubic over
+        // the requested duration). Mutually exclusive with `scroll_target`
+        // — `animate_scroll_to` clears scroll_target when set.
+        if let Some(anim) = self.scroll_animation.clone() {
+            let elapsed = Instant::now().saturating_duration_since(anim.start_time);
+            if elapsed >= anim.duration {
+                self.scroll_offset = anim.target_offset;
+                self.scroll_animation = None;
+            } else {
+                let dur = anim.duration.as_secs_f32().max(1e-3);
+                let t = (elapsed.as_secs_f32() / dur).clamp(0.0, 1.0);
+                let eased = 1.0 - (1.0 - t).powi(3);
+                self.scroll_offset =
+                    anim.start_offset + (anim.target_offset - anim.start_offset) * eased;
+            }
+            moved = true;
+        } else if let Some(target) = self.scroll_target {
+            // Exponential scroll smoothing (user-driven; mirrors config).
             let diff = target - self.scroll_offset;
             if diff.abs() < 0.5 {
                 self.scroll_offset = target;
@@ -262,6 +301,33 @@ impl ScrollTiler {
         }
 
         self.is_animating()
+    }
+
+    /// Begin a time-based smooth scroll to `target_offset` over
+    /// `duration_ms`. Used by the HTTP API's
+    /// `POST /scroll {offset|delta, animate_ms}`. Calling again while
+    /// another scroll animation is in flight **replaces** the in-flight
+    /// target — there's no queue. `duration_ms == 0` snaps immediately
+    /// and cancels any in-flight animation. Clears `scroll_target` so
+    /// the exponential smoothing path doesn't compete with the
+    /// time-based one.
+    pub fn animate_scroll_to(&mut self, target_offset: f32, duration_ms: u32) {
+        self.scroll_target = None;
+        if duration_ms == 0 {
+            self.scroll_offset = target_offset;
+            self.scroll_animation = None;
+            let positions = self.windows_positions();
+            self.layout_windows(&positions);
+            self.mark_motion();
+        } else {
+            self.scroll_animation = Some(ScrollAnimation {
+                start_offset: self.scroll_offset,
+                target_offset,
+                start_time: Instant::now(),
+                duration: Duration::from_millis(u64::from(duration_ms)),
+            });
+            self.mark_motion();
+        }
     }
 
     /// Begin a smooth scroll so the window with the given HWND ends up
@@ -380,6 +446,9 @@ impl ScrollTiler {
     /// enabled, the target accumulates and the next animation tick moves
     /// toward it; otherwise the scroll snaps.
     pub fn scroll_by(&mut self, delta_px: f32) {
+        // User-driven scroll overrides any in-flight time-based API
+        // animation — last-input-wins.
+        self.scroll_animation = None;
         if self.smooth_scroll_enabled {
             let base = self.scroll_target.unwrap_or(self.scroll_offset);
             self.scroll_target = Some(base + delta_px);
@@ -393,6 +462,7 @@ impl ScrollTiler {
 
     /// Set an absolute scroll offset.
     pub fn set_scroll_offset(&mut self, offset_px: f32) {
+        self.scroll_animation = None;
         if self.smooth_scroll_enabled {
             self.scroll_target = Some(offset_px);
         } else {

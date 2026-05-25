@@ -300,8 +300,14 @@ fn handle_scroll(mut request: Request) -> anyhow::Result<()> {
     };
 
     let command = match (req.offset, req.delta) {
-        (Some(offset), _) => ApiCommand::SetScrollOffset(offset),
-        (None, Some(delta)) => ApiCommand::ScrollBy(delta),
+        (Some(offset), _) => ApiCommand::SetScrollOffset {
+            offset,
+            animate_ms: req.animate_ms,
+        },
+        (None, Some(delta)) => ApiCommand::ScrollBy {
+            delta,
+            animate_ms: req.animate_ms,
+        },
         (None, None) => {
             return respond_error(request, 400, "must provide `offset` or `delta`");
         }

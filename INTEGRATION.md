@@ -134,20 +134,36 @@ Response: `202 Accepted` on success.
 
 Set the strip's horizontal scroll offset. JSON body:
 
-| Field    | Type    | Meaning                                              |
-| -------- | ------- | ---------------------------------------------------- |
-| `offset` | number  | Absolute scroll position in pixels                   |
-| `delta`  | number  | Relative scroll in pixels (positive = strip → right) |
+| Field        | Type   | Meaning                                                       |
+| ------------ | ------ | ------------------------------------------------------------- |
+| `offset`     | number | Absolute scroll position in pixels                            |
+| `delta`      | number | Relative scroll in pixels (positive = strip → right)          |
+| `animate_ms` | number | Optional. `0` (default) snaps; positive value tweens that long |
 
 Provide either `offset` *or* `delta`. If both, `offset` wins.
 
 ```sh
+# Snap (today's behaviour, backward-compatible)
 curl -X POST http://127.0.0.1:47812/scroll \
      -H 'Content-Type: application/json' \
      -d '{"offset": 1200}'
 
 curl -X POST http://127.0.0.1:47812/scroll -d '{"delta": -200}'
+
+# Smooth-tween over 80ms — ideal for fire-and-forget streaming
+# (touchpad scrub bar, pointermove handlers): each request just
+# supersedes the in-flight target with no queue on the client side.
+curl -X POST http://127.0.0.1:47812/scroll \
+     -H 'Content-Type: application/json' \
+     -d '{"offset": 1200, "animate_ms": 80}'
 ```
+
+`animate_ms` uses the same ease-out-cubic and 16ms tick loop that drives
+`/windows/<id>/resize` smoothing. **Sending a new `/scroll` while one is
+in flight replaces the target** — latest wins, no queueing. This composes
+with resize animations: a "fly to this thumbnail" gesture can be a single
+POST to `/scroll` with the target offset plus a POST to
+`/windows/<id>/resize` with `center: true`, both finishing together.
 
 ### `POST /windows/{id}/resize`
 

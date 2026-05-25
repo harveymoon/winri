@@ -14,6 +14,16 @@ pub struct ScrollRequest {
     /// (windows slide left).
     #[serde(default)]
     pub delta: Option<f32>,
+    /// Optional animation duration in ms. `0` (default) snaps instantly
+    /// — backward compatible with every existing caller. A positive
+    /// value tweens from the current `scroll_offset` to the requested
+    /// target over the duration using the same ease-out-cubic and 16ms
+    /// tick loop that drives smooth resize. Sending another /scroll
+    /// while one is in flight **replaces** the in-flight target
+    /// (latest wins, no queue) — ideal for pointermove-streamed scrub
+    /// bars.
+    #[serde(default)]
+    pub animate_ms: u32,
 }
 
 /// Discrete, named actions equivalent to the keyboard shortcuts. The string
@@ -45,10 +55,13 @@ pub enum ApiCommand {
     /// Focus the window with the given HWND, scrolling the strip if
     /// necessary (uses the normal focus path so all UX rules apply).
     Focus(u64),
-    /// Apply an absolute scroll offset.
-    SetScrollOffset(f32),
-    /// Apply a relative scroll delta in pixels.
-    ScrollBy(f32),
+    /// Apply an absolute scroll offset. `animate_ms == 0` snaps; positive
+    /// values run a time-based scroll animation that supersedes any
+    /// in-flight one.
+    SetScrollOffset { offset: f32, animate_ms: u32 },
+    /// Apply a relative scroll delta in pixels. Same `animate_ms`
+    /// semantics as `SetScrollOffset`.
+    ScrollBy { delta: f32, animate_ms: u32 },
     /// Run one of the named keyboard-equivalent actions.
     Action(NamedAction),
     /// Move the window with the given HWND to the monitor identified by

@@ -300,15 +300,30 @@ impl State {
                 }
                 Task::none()
             }
-            ApiCommand::SetScrollOffset(offset) => {
+            ApiCommand::SetScrollOffset { offset, animate_ms } => {
                 if matches!(self.mode, Mode::Tiler(_)) {
-                    self.tiler.set_scroll_offset(offset);
+                    if animate_ms == 0 {
+                        // Existing snap path: respects the user's
+                        // smooth_scroll config (snap or exponential).
+                        self.tiler.set_scroll_offset(offset);
+                    } else {
+                        // Time-based animation: ignores smooth_scroll
+                        // config, always tweens over animate_ms with
+                        // ease-out-cubic. Supersedes any in-flight
+                        // animation (latest wins).
+                        self.tiler.animate_scroll_to(offset, animate_ms);
+                    }
                 }
                 Task::none()
             }
-            ApiCommand::ScrollBy(delta) => {
+            ApiCommand::ScrollBy { delta, animate_ms } => {
                 if matches!(self.mode, Mode::Tiler(_)) {
-                    self.tiler.scroll_by(delta);
+                    if animate_ms == 0 {
+                        self.tiler.scroll_by(delta);
+                    } else {
+                        let target = self.tiler.scroll_offset() + delta;
+                        self.tiler.animate_scroll_to(target, animate_ms);
+                    }
                 }
                 Task::none()
             }

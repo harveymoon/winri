@@ -630,6 +630,25 @@ impl app::State {
         Ok(())
     }
 
+    /// "Force redraw" action — runs the SetWindowRgn(NULL) +
+    /// SWP_FRAMECHANGED + RedrawWindow sequence to unstick a window
+    /// whose compositor went blank but is still receiving input.
+    /// Mirrors `POST /windows/{id}/wake` so the right-click menu has
+    /// the same affordance as the API.
+    pub fn overview_action_force_redraw(&mut self, hwnd_raw: u64) -> anyhow::Result<()> {
+        let target = crate::window::Window::from_safe_hwnd(hwnd_raw)
+            .context("invalid HWND for Force redraw")?;
+        target
+            .force_repaint()
+            .context("running repaint sequence on target window")?;
+        log::info!(
+            "Overview menu: force-redraw on {:?}",
+            target.handle()
+        );
+        self.dismiss_overview_context_menu();
+        Ok(())
+    }
+
     pub fn reorder_overview(&mut self, src: Window, dst: Window) -> anyhow::Result<()> {
         self.tiler.reorder(src, dst);
 

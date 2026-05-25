@@ -101,6 +101,17 @@ fn build_context_menu<'a>(menu: &'a ContextMenu) -> iced::Element<'a, app::Messa
         );
     }
 
+    // Recovery affordance — best-effort wake-up for windows whose
+    // compositor has stopped producing frames (most often Chromium
+    // apps going blank/dark grey while still receiving hover).
+    items = items.push(
+        button(text("Force redraw").size(13))
+            .on_press(app::Message::OverviewForceRedraw(
+                menu.target.handle().0 as u64,
+            ))
+            .width(Length::Fixed(220.0)),
+    );
+
     let menu_block = container(items)
         .padding(8)
         .style(|theme: &Theme| {

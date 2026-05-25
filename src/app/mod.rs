@@ -108,6 +108,11 @@ pub enum Message {
         target: window::Window,
         device_name: String,
     },
+    /// Best-effort "wake up the renderer" for the targeted window. Same
+    /// repaint sequence as `POST /windows/{id}/wake` — useful when a
+    /// Chromium app's compositor has gone blank and the user wants a
+    /// one-click unstick.
+    OverviewForceRedraw(u64),
 
     CleanupAndExit,
 }
@@ -514,6 +519,11 @@ impl State {
                     log::warn!("Move-to-monitor action failed: {e:#}");
                 }
                 let _ = self.update_tiler();
+            }
+            Message::OverviewForceRedraw(hwnd) => {
+                if let Err(e) = self.overview_action_force_redraw(hwnd) {
+                    log::warn!("Force-redraw action failed: {e:#}");
+                }
             }
             Message::WindowClosed(window_id) => {
                 // Clear cached ids that pointed at the closed window so a

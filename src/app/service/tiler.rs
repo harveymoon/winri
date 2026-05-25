@@ -163,6 +163,8 @@ impl app::State {
                 x: current_x,
                 monitor: monitor_lookup(item.inner.monitor()),
                 tiled: true,
+                minimized: item.inner.is_iconic(),
+                desktop_id: crate::virtual_desktop::desktop_id_for(hwnd_raw),
             });
             current_x += item.width + self.tiler.padding();
         }
@@ -193,6 +195,8 @@ impl app::State {
                     x: 0.0,
                     monitor: monitor_lookup(w.monitor()),
                     tiled: false,
+                    minimized: w.is_iconic(),
+                    desktop_id: crate::virtual_desktop::desktop_id_for(hwnd_raw),
                 });
             }
         }

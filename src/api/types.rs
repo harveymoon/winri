@@ -78,6 +78,12 @@ pub struct WindowDescriptor {
     pub focused: bool,
     pub monitor: String,
     pub tiled: bool,
+    /// `true` if the window is currently minimized to the taskbar.
+    pub minimized: bool,
+    /// 1-indexed virtual-desktop number. Omitted when the OS doesn't
+    /// track the window in any virtual desktop (rare shell windows).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub desktop_id: Option<u32>,
 }
 
 /// Returned by `GET /monitors`.

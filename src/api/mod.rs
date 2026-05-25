@@ -74,6 +74,12 @@ pub struct WindowSnapshot {
     /// `true` if the window is part of the tiler's strip, `false` if it's
     /// a free-floating window.
     pub tiled: bool,
+    /// `true` if the window is currently minimized (`IsIconic`).
+    pub minimized: bool,
+    /// 1-indexed virtual-desktop number. `None` for windows the OS
+    /// doesn't track via the public virtual-desktop API (some shell
+    /// windows). See `virtual_desktop` module docs for indexing rules.
+    pub desktop_id: Option<u32>,
 }
 
 static API_STATE: OnceLock<RwLock<ApiState>> = OnceLock::new();

@@ -159,6 +159,8 @@ fn window_descriptors(state: &crate::api::ApiState) -> Vec<WindowDescriptor> {
             focused: Some(w.id) == state.focused_window_id,
             monitor: w.monitor.clone(),
             tiled: w.tiled,
+            minimized: w.minimized,
+            desktop_id: w.desktop_id,
         })
         .collect()
 }

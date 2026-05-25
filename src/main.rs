@@ -33,6 +33,7 @@ mod scroll_tiler;
 mod system;
 mod tray;
 mod utils;
+mod virtual_desktop;
 mod winapi;
 mod window;
 

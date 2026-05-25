@@ -58,7 +58,11 @@ Returns the full current state in one shot.
       "class": "Chrome_WidgetWin_1",
       "width": 1280.0,
       "x": 10.0,
-      "focused": true
+      "focused": true,
+      "monitor": "\\\\.\\DISPLAY1",
+      "tiled": true,
+      "minimized": false,
+      "desktop_id": 1
     },
     ...
   ],
@@ -74,6 +78,20 @@ the window closes.
 
 `x` is the window's position in **tile-strip coordinates** (not screen
 coordinates). Subtract `scroll_offset` to get on-screen X.
+
+`minimized` mirrors `IsIconic(hwnd)` — true when the window is currently
+collapsed to the taskbar.
+
+`desktop_id` is a 1-indexed virtual-desktop identifier from Windows' public
+`IVirtualDesktopManager` COM interface. Two windows on the same desktop
+always share the same number, and numbers are stable for the lifetime of
+the winri process. **Order is first-sighting within the session, not
+guaranteed to match Win+Tab numbering.** In practice the desktop winri
+started on is `1`; others get `2, 3, ...` in the order their windows first
+appear in a `/state` poll. The field is **omitted** (not `null`) for the
+rare windows the OS doesn't track in any virtual desktop, so a `.get(...)`
+or `if 'desktop_id' in w` check distinguishes "untracked" from "tracked as
+desktop 0".
 
 ### `GET /windows`
 

@@ -92,6 +92,13 @@ pub enum Message {
     /// context menu when applicable.
     WindowMouseRightDown(iced::window::Id),
 
+    /// An iced-managed window was closed (X-button, OS close, etc.). We
+    /// must clear any cached id pointing at it (e.g. `settings_window_id`)
+    /// or the next "open it again" path tries to gain_focus on a defunct
+    /// handle and silently fails — the visible symptom is that Win+,
+    /// stops opening the settings panel until you press it twice.
+    WindowClosed(iced::window::Id),
+
     /// Context-menu actions fired by the overview popup buttons.
     OverviewIgnoreApp(String),
     /// Session-only ignore — just this window's HWND falls out of the
@@ -130,8 +137,11 @@ fn create_settings_window() -> (iced::window::Id, Task<Message>) {
         transparent: false,
         resizable: true,
         closeable: true,
-        size: iced::Size::new(560.0, 640.0),
-        min_size: Some(iced::Size::new(420.0, 420.0)),
+        // Modal-on-top: keep the settings panel above tiles so the user
+        // doesn't lose it behind a focus-stealing app while editing.
+        level: iced::window::Level::AlwaysOnTop,
+        size: iced::Size::new(720.0, 560.0),
+        min_size: Some(iced::Size::new(540.0, 420.0)),
         ..Default::default()
     });
     (id, task.discard())
@@ -315,6 +325,35 @@ impl State {
                 }
                 Task::none()
             }
+            ApiCommand::ResizeWindow {
+                hwnd,
+                target_width,
+                animate_ms,
+                center,
+            } => {
+                if matches!(self.mode, Mode::Tiler(_)) {
+                    let ok = self.tiler.animate_window_width(hwnd, target_width, animate_ms);
+                    if !ok {
+                        log::warn!(
+                            "API ResizeWindow: HWND {hwnd} not tracked by the tiler"
+                        );
+                    } else if center {
+                        // Compute centering against the FINAL width (not the
+                        // live interpolated one) so the scroll animation
+                        // converges on the position that'll be correct when
+                        // the resize completes — both animations run in the
+                        // same 16ms tick loop and finish together for
+                        // typical animate_ms values.
+                        self.tiler.center_window_at_width(hwnd, target_width);
+                    }
+                } else {
+                    log::warn!(
+                        "API ResizeWindow ignored: not in Tiler mode (current = {:?})",
+                        std::mem::discriminant(&self.mode)
+                    );
+                }
+                Task::none()
+            }
         }
     }
 }
@@ -449,6 +488,16 @@ impl State {
                 }
                 let _ = self.update_tiler();
             }
+            Message::WindowClosed(window_id) => {
+                // Clear cached ids that pointed at the closed window so a
+                // subsequent open_x() doesn't try to gain_focus on a defunct
+                // handle. Specifically fixes: close settings via X, then
+                // Win+, no longer reopens (it called gain_focus on a stale
+                // id which silently failed).
+                if self.settings_window_id == Some(window_id) {
+                    self.settings_window_id = None;
+                }
+            }
         }
         if matches!(self.mode, Mode::Exit) {
             task = task.chain(Task::done(Message::CleanupAndExit));
@@ -553,6 +602,7 @@ fn on_event(
         iced::Event::Mouse(MouseEvent::ButtonPressed(Button::Right)) => {
             Some(Message::WindowMouseRightDown(window_id))
         }
+        iced::Event::Window(iced::window::Event::Closed) => Some(Message::WindowClosed(window_id)),
         _ => None,
     }
 }

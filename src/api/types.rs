@@ -54,6 +54,15 @@ pub enum ApiCommand {
     /// Move the window with the given HWND to the monitor identified by
     /// device name (e.g. `\\.\DISPLAY2`).
     MoveToMonitor { hwnd: u64, device_name: String },
+    /// Smoothly resize the tile width for the window with the given HWND.
+    /// `animate_ms == 0` snaps instantly. If `center` is true, scroll
+    /// smoothly so the resized window ends up centered in the viewport.
+    ResizeWindow {
+        hwnd: u64,
+        target_width: f32,
+        animate_ms: u32,
+        center: bool,
+    },
 }
 
 /// Returned by `GET /windows`.
@@ -93,6 +102,23 @@ pub struct WorkArea {
 #[derive(Debug, Clone, Deserialize)]
 pub struct MoveToMonitorRequest {
     pub device_name: String,
+}
+
+/// Body for `POST /windows/{id}/resize`. `animate_ms` defaults to 0
+/// (instant) when omitted; pass e.g. 250 for a quarter-second smooth
+/// transition driven by the same 16ms tick loop as scroll smoothing.
+///
+/// `center` (default false) additionally starts a smooth scroll so the
+/// resized window ends up centered in the viewport at its final width —
+/// useful for a "fullscreen this app" button that should both grow the
+/// tile and bring it on-screen in one motion.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResizeRequest {
+    pub width: f32,
+    #[serde(default)]
+    pub animate_ms: u32,
+    #[serde(default)]
+    pub center: bool,
 }
 
 /// Returned by `GET /state`.

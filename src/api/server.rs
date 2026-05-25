@@ -9,8 +9,8 @@ use crate::{
     api::{
         ApiCommand, NamedAction, ScrollRequest, capture, current_state, send_message,
         types::{
-            ErrorBody, MonitorDescriptor, MoveToMonitorRequest, StateResponse, WindowDescriptor,
-            WorkArea,
+            ErrorBody, MonitorDescriptor, MoveToMonitorRequest, ResizeRequest, StateResponse,
+            WindowDescriptor, WorkArea,
         },
     },
     app::Message,
@@ -76,6 +76,10 @@ fn handle_request(request: Request) -> anyhow::Result<()> {
             let id_str =
                 &path["/windows/".len()..path.len() - "/move-to-monitor".len()];
             handle_move_to_monitor(request, id_str)
+        }
+        (Method::Post, path) if path.starts_with("/windows/") && path.ends_with("/resize") => {
+            let id_str = &path["/windows/".len()..path.len() - "/resize".len()];
+            handle_resize(request, id_str)
         }
         (Method::Get, path) if path.starts_with("/windows/") && path.ends_with("/thumbnail") => {
             let id_str = &path["/windows/".len()..path.len() - "/thumbnail".len()];
@@ -221,6 +225,31 @@ fn handle_move_to_monitor(mut request: Request, id_str: &str) -> anyhow::Result<
         ApiCommand::MoveToMonitor {
             hwnd,
             device_name: req.device_name,
+        },
+    )
+}
+
+fn handle_resize(mut request: Request, id_str: &str) -> anyhow::Result<()> {
+    let hwnd: u64 = match id_str.parse() {
+        Ok(v) => v,
+        Err(_) => return respond_error(request, 400, "invalid window id"),
+    };
+    let mut body = String::new();
+    request.as_reader().read_to_string(&mut body).ok();
+    let req: ResizeRequest = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(e) => return respond_error(request, 400, &format!("invalid JSON: {e}")),
+    };
+    if !req.width.is_finite() || req.width <= 0.0 {
+        return respond_error(request, 400, "`width` must be a positive finite number");
+    }
+    dispatch_command(
+        request,
+        ApiCommand::ResizeWindow {
+            hwnd,
+            target_width: req.width,
+            animate_ms: req.animate_ms,
+            center: req.center,
         },
     )
 }

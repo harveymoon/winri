@@ -1,48 +1,62 @@
-//! In-app settings window — view + state.
+//! In-app settings panel.
 //!
-//! The form is a mutable mirror of [`crate::config::Config`]: numeric fields
-//! are kept as `String` while editing so partial input ("12.") doesn't reject,
-//! and lists are mutated locally until the user clicks Save.
+//! Modal-on-top window (`Level::AlwaysOnTop`) with vertical side-tabs:
+//!   General  – padding, resize step
+//!   Apps     – currently-tiled apps with one-click "ignore exe / class"
+//!   Excludes – the three persistent ignore lists, compact rows
+//!
+//! Form fields mirror [`crate::config::Config`]; numeric inputs are kept
+//! as `String` while editing so partial input ("12.") doesn't reject.
+//! Nothing persists until the user clicks Save.
 
 use iced::{
-    Element, Length,
-    widget::{button, column, container, row, scrollable, text, text_input},
+    Alignment, Element, Length, Padding,
+    widget::{Space, button, column, container, row, scrollable, text, text_input},
 };
 
 use crate::{app, config};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsTab {
+    General,
+    Apps,
+    Excludes,
+}
+
+impl Default for SettingsTab {
+    fn default() -> Self {
+        Self::General
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SettingsForm {
+    pub active_tab: SettingsTab,
     pub padding: String,
     pub resize_increment: String,
     pub ignored_processes: Vec<String>,
     pub ignored_classes: Vec<String>,
-    /// Per-window persistent ignores. Editable from the settings UI so
-    /// users can review and remove rules they previously added via Win+I
-    /// or the overview right-click menu.
+    /// Per-window persistent ignores. Editable here so users can review
+    /// and remove rules they added via Win+I or the overview right-click.
     pub ignored_window_titles: Vec<config::IgnoredWindowTitle>,
     pub new_process: String,
     pub new_class: String,
     pub status: Option<String>,
-    /// Snapshot of the currently-tiled windows when the settings panel was
-    /// opened. Lets the user one-click "Ignore" instead of typing exe names.
+    /// Snapshot of the currently-tiled windows when the panel was opened.
     pub current_windows: Vec<WindowInfo>,
 }
 
 #[derive(Debug, Clone)]
 pub struct WindowInfo {
-    /// `chrome.exe`, etc.
     pub process: String,
-    /// Win32 window class name.
     pub class: String,
-    /// Display name derived from the process exe (e.g. "Chrome").
     pub app_name: String,
-    /// Truncated window title for display.
     pub title: String,
 }
 
 #[derive(Debug, Clone)]
 pub enum SettingsMessage {
+    TabSelected(SettingsTab),
     PaddingChanged(String),
     ResizeIncrementChanged(String),
     NewProcessChanged(String),
@@ -60,11 +74,10 @@ pub enum SettingsMessage {
 }
 
 impl SettingsForm {
-    /// Populate the form from the live config and a snapshot of currently
-    /// tiled windows.
     pub fn from_current_config(current_windows: Vec<WindowInfo>) -> Self {
         let cfg = config::current();
         Self {
+            active_tab: SettingsTab::default(),
             padding: cfg.tiling.padding.to_string(),
             resize_increment: cfg.tiling.resize_increment.to_string(),
             ignored_processes: cfg.filter.ignored_processes.clone(),
@@ -77,8 +90,6 @@ impl SettingsForm {
         }
     }
 
-    /// Try to build a `Config` from the current form values. Returns an error
-    /// string suitable for showing the user if numeric parsing fails.
     fn build_config(&self) -> Result<config::Config, String> {
         let padding: f32 = self
             .padding
@@ -91,9 +102,6 @@ impl SettingsForm {
                 self.resize_increment
             )
         })?;
-        // Preserve config fields the settings UI doesn't currently expose
-        // (api section, smooth-scroll knobs, monitors section) by reading
-        // them from the live config and passing them through unchanged.
         let live = config::current();
         let api = live.api.clone();
         let monitors = live.monitors.clone();
@@ -119,9 +127,10 @@ impl SettingsForm {
     }
 }
 
-/// Returns `Some(true)` if the host should close the settings window.
+/// Returns `true` if the host should close the settings window.
 pub fn update(form: &mut SettingsForm, message: SettingsMessage) -> bool {
     match message {
+        SettingsMessage::TabSelected(tab) => form.active_tab = tab,
         SettingsMessage::PaddingChanged(v) => {
             form.padding = v;
             form.status = None;
@@ -206,97 +215,139 @@ pub fn update(form: &mut SettingsForm, message: SettingsMessage) -> bool {
 }
 
 pub fn view(form: &SettingsForm) -> Element<'_, app::Message> {
-    let title = text("Winri settings").size(22);
-
-    let tiling_section = column![
-        text("Tiling").size(16),
-        row![
-            text("Padding (px):").width(Length::Fixed(160.0)),
-            text_input("10", &form.padding)
-                .on_input(|v| msg(SettingsMessage::PaddingChanged(v)))
-                .width(Length::Fixed(100.0)),
-        ]
-        .spacing(10)
-        .align_y(iced::Alignment::Center),
-        row![
-            text("Resize step (px):").width(Length::Fixed(160.0)),
-            text_input("20", &form.resize_increment)
-                .on_input(|v| msg(SettingsMessage::ResizeIncrementChanged(v)))
-                .width(Length::Fixed(100.0)),
-        ]
-        .spacing(10)
-        .align_y(iced::Alignment::Center),
-    ]
-    .spacing(8);
-
-    let processes_section = list_section(
-        "Ignored processes (.exe filename)",
-        &form.ignored_processes,
-        &form.new_process,
-        "e.g. MyOverlayApp.exe",
-        |v| msg(SettingsMessage::NewProcessChanged(v)),
-        msg(SettingsMessage::AddProcess),
-        |i| msg(SettingsMessage::RemoveProcess(i)),
-    );
-
-    let classes_section = list_section(
-        "Ignored window classes",
-        &form.ignored_classes,
-        &form.new_class,
-        "e.g. CEF-OSC-WIDGET",
-        |v| msg(SettingsMessage::NewClassChanged(v)),
-        msg(SettingsMessage::AddClass),
-        |i| msg(SettingsMessage::RemoveClass(i)),
-    );
-
-    let current_section = current_windows_section(form);
-    let per_window_section = ignored_windows_section(form);
+    let tabs = side_tabs(form.active_tab);
+    let body = scrollable(
+        container(match form.active_tab {
+            SettingsTab::General => general_tab(form),
+            SettingsTab::Apps => apps_tab(form),
+            SettingsTab::Excludes => excludes_tab(form),
+        })
+        .padding(Padding {
+            top: 18.0,
+            right: 22.0,
+            bottom: 18.0,
+            left: 22.0,
+        }),
+    )
+    .height(Length::Fill);
 
     let status_line: Element<'_, app::Message> = if let Some(msg_text) = &form.status {
-        text(msg_text.as_str()).size(13).into()
+        text(msg_text.as_str()).size(12).into()
     } else {
-        text(
-            "Edits aren't saved until you click Save. Filter changes apply immediately on save; \
-             padding/resize step require a winri restart.",
-        )
-        .size(12)
-        .into()
+        text("Edits aren't saved until you press Save.").size(11).into()
     };
 
     let actions = row![
-        button(text("Reload from disk")).on_press(msg(SettingsMessage::ReloadFromDisk)),
-        iced::widget::space::horizontal(),
-        button(text("Close")).on_press(msg(SettingsMessage::Close)),
-        button(text("Save")).on_press(msg(SettingsMessage::Save)),
+        button(text("Reload from disk").size(12))
+            .on_press(msg(SettingsMessage::ReloadFromDisk)),
+        Space::new().width(Length::Fill),
+        button(text("Close").size(12)).on_press(msg(SettingsMessage::Close)),
+        button(text("Save").size(12)).on_press(msg(SettingsMessage::Save)),
     ]
-    .spacing(8);
+    .spacing(8)
+    .align_y(Alignment::Center);
 
-    let content = column![
-        title,
-        tiling_section,
-        current_section,
-        processes_section,
-        classes_section,
-        per_window_section,
-        status_line,
-        actions,
-    ]
-    .spacing(18)
-    .padding(20);
+    let footer = column![status_line, actions]
+        .spacing(8)
+        .padding(Padding {
+            top: 10.0,
+            right: 14.0,
+            bottom: 12.0,
+            left: 14.0,
+        });
 
-    container(scrollable(content))
+    let main = row![tabs, body];
+    container(column![main, footer])
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
 }
 
-fn msg(m: SettingsMessage) -> app::Message {
-    app::Message::Settings(m)
+fn side_tabs(active: SettingsTab) -> Element<'static, app::Message> {
+    let item = |label: &'static str, tab: SettingsTab, active: bool| -> Element<'_, app::Message> {
+        let style = if active {
+            button::primary
+        } else {
+            button::secondary
+        };
+        button(text(label).size(13))
+            .on_press(msg(SettingsMessage::TabSelected(tab)))
+            .style(style)
+            .width(Length::Fill)
+            .into()
+    };
+
+    container(
+        column![
+            item("General", SettingsTab::General, active == SettingsTab::General),
+            item("Apps", SettingsTab::Apps, active == SettingsTab::Apps),
+            item(
+                "Excludes",
+                SettingsTab::Excludes,
+                active == SettingsTab::Excludes,
+            ),
+        ]
+        .spacing(6)
+        .padding(Padding {
+            top: 18.0,
+            right: 10.0,
+            bottom: 18.0,
+            left: 14.0,
+        }),
+    )
+    .width(Length::Fixed(150.0))
+    .height(Length::Fill)
+    .into()
 }
 
-fn current_windows_section(form: &SettingsForm) -> Element<'_, app::Message> {
-    let header = text("Currently tiled apps").size(16);
-    let hint = text("Quick-add to the ignore lists below without typing exe names.").size(11);
+fn general_tab(form: &SettingsForm) -> Element<'_, app::Message> {
+    column![
+        text("General").size(18),
+        Space::new().height(Length::Fixed(4.0)),
+        labeled_input(
+            "Padding (px)",
+            "10",
+            &form.padding,
+            |v| msg(SettingsMessage::PaddingChanged(v)),
+        ),
+        labeled_input(
+            "Resize step (px)",
+            "20",
+            &form.resize_increment,
+            |v| msg(SettingsMessage::ResizeIncrementChanged(v)),
+        ),
+        Space::new().height(Length::Fixed(6.0)),
+        text(
+            "Padding and resize step take effect on winri restart. Filter changes apply on save."
+        )
+        .size(11),
+    ]
+    .spacing(10)
+    .into()
+}
+
+fn labeled_input<'a>(
+    label: &'a str,
+    placeholder: &'a str,
+    value: &'a str,
+    on_input: impl Fn(String) -> app::Message + 'a,
+) -> Element<'a, app::Message> {
+    row![
+        text(label).size(12).width(Length::Fixed(150.0)),
+        text_input(placeholder, value)
+            .on_input(on_input)
+            .size(13)
+            .width(Length::Fixed(120.0)),
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+fn apps_tab(form: &SettingsForm) -> Element<'_, app::Message> {
+    let header = text("Currently tiled apps").size(18);
+    let hint =
+        text("Quick-ignore by exe or window class without typing names.").size(11);
 
     if form.current_windows.is_empty() {
         return column![header, hint, text("(no tiled windows right now)").size(12)]
@@ -304,11 +355,7 @@ fn current_windows_section(form: &SettingsForm) -> Element<'_, app::Message> {
             .into();
     }
 
-    // Consolidate windows by process so e.g. four Chrome windows show as one
-    // row ("Chrome (4)") instead of cluttering the list. The first window we
-    // see for each process is treated as the representative for the class
-    // name displayed; that's fine because almost all multi-window apps use
-    // the same class for their main windows.
+    // Consolidate by process so 4 Chrome windows render as one "Chrome (4)" row.
     struct Group<'a> {
         app_name: &'a str,
         process: &'a str,
@@ -331,7 +378,7 @@ fn current_windows_section(form: &SettingsForm) -> Element<'_, app::Message> {
         }
     }
 
-    let mut list = column![].spacing(6);
+    let mut list = column![].spacing(4);
     for g in &groups {
         let exe_ignored = form.ignored_processes.iter().any(|p| p == g.process);
         let class_ignored = form
@@ -339,28 +386,28 @@ fn current_windows_section(form: &SettingsForm) -> Element<'_, app::Message> {
             .iter()
             .any(|c| c == g.representative_class);
 
-        let title_or_count = if g.count == 1 {
+        let subtitle = if g.count == 1 {
             g.sample_title.to_string()
         } else {
             format!("{} windows", g.count)
         };
 
-        let info_column = column![
-            text(g.app_name).size(14),
-            text(title_or_count).size(11),
+        let info = column![
+            text(g.app_name).size(13),
+            text(subtitle).size(10),
             text(format!("{}  •  {}", g.process, g.representative_class)).size(10),
         ]
-        .spacing(2)
+        .spacing(1)
         .width(Length::Fill);
 
-        let exe_button: Element<'_, app::Message> = if exe_ignored {
+        let exe_btn: Element<'_, app::Message> = if exe_ignored {
             text("✓ exe").size(11).into()
         } else {
             button(text("Ignore exe").size(11))
                 .on_press(msg(SettingsMessage::AddProcessByName(g.process.to_string())))
                 .into()
         };
-        let class_button: Element<'_, app::Message> = if class_ignored {
+        let class_btn: Element<'_, app::Message> = if class_ignored {
             text("✓ class").size(11).into()
         } else {
             button(text("Ignore class").size(11))
@@ -371,63 +418,56 @@ fn current_windows_section(form: &SettingsForm) -> Element<'_, app::Message> {
         };
 
         list = list.push(
-            row![info_column, exe_button, class_button]
-                .spacing(8)
-                .align_y(iced::Alignment::Center),
+            container(
+                row![info, exe_btn, class_btn]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+            )
+            .padding(Padding {
+                top: 6.0,
+                right: 8.0,
+                bottom: 6.0,
+                left: 8.0,
+            }),
         );
     }
 
-    column![header, hint, list].spacing(8).into()
+    column![header, hint, Space::new().height(Length::Fixed(4.0)), list]
+        .spacing(6)
+        .into()
 }
 
-fn ignored_windows_section(form: &SettingsForm) -> Element<'_, app::Message> {
-    let header = text("Ignored windows (per-window)").size(16);
-    let hint = text(
-        "Specific windows ignored by (process, title, class). Added via Win+I or the overview's \
-         right-click \u{2192} \u{201C}Ignore this window\u{201D}.",
-    )
-    .size(11);
-
-    if form.ignored_window_titles.is_empty() {
-        return column![header, hint, text("(none)").size(12)]
-            .spacing(8)
-            .into();
-    }
-
-    let mut list = column![].spacing(4);
-    for (i, entry) in form.ignored_window_titles.iter().enumerate() {
-        let class_str = entry
-            .class
-            .as_deref()
-            .map_or_else(|| "(any class)".to_string(), |c| format!("class={c}"));
-        let title_str = if entry.title.is_empty() {
-            "(empty title)".to_string()
-        } else {
-            entry.title.clone()
-        };
-
-        let info = column![
-            text(format!("{}  \u{2022}  {}", entry.process, class_str)).size(12),
-            text(title_str).size(11),
-        ]
-        .spacing(2)
-        .width(Length::Fill);
-
-        list = list.push(
-            row![
-                info,
-                button(text("\u{00D7}").size(13))
-                    .on_press(msg(SettingsMessage::RemoveIgnoredWindow(i))),
-            ]
-            .spacing(8)
-            .align_y(iced::Alignment::Center),
-        );
-    }
-
-    column![header, hint, list].spacing(8).into()
+fn excludes_tab(form: &SettingsForm) -> Element<'_, app::Message> {
+    column![
+        text("Excludes").size(18),
+        text("Processes, window classes, and specific windows winri skips when tiling.")
+            .size(11),
+        Space::new().height(Length::Fixed(8.0)),
+        compact_list_section(
+            "Ignored processes (.exe)",
+            &form.ignored_processes,
+            &form.new_process,
+            "MyOverlayApp.exe",
+            |v| msg(SettingsMessage::NewProcessChanged(v)),
+            msg(SettingsMessage::AddProcess),
+            |i| msg(SettingsMessage::RemoveProcess(i)),
+        ),
+        compact_list_section(
+            "Ignored window classes",
+            &form.ignored_classes,
+            &form.new_class,
+            "CEF-OSC-WIDGET",
+            |v| msg(SettingsMessage::NewClassChanged(v)),
+            msg(SettingsMessage::AddClass),
+            |i| msg(SettingsMessage::RemoveClass(i)),
+        ),
+        per_window_section(form),
+    ]
+    .spacing(14)
+    .into()
 }
 
-fn list_section<'a>(
+fn compact_list_section<'a>(
     label: &'a str,
     items: &'a [String],
     new_input: &'a str,
@@ -436,18 +476,20 @@ fn list_section<'a>(
     add_message: app::Message,
     remove_message: impl Fn(usize) -> app::Message + 'a,
 ) -> Element<'a, app::Message> {
-    let mut list = column![].spacing(4);
+    let mut list = column![].spacing(2);
     if items.is_empty() {
-        list = list.push(text("(none)").size(12));
+        list = list.push(text("(none)").size(11));
     } else {
         for (i, item) in items.iter().enumerate() {
             list = list.push(
                 row![
-                    text(item.as_str()).width(Length::Fill),
-                    button(text("×")).on_press(remove_message(i)),
+                    text(item.as_str()).size(12).width(Length::Fill),
+                    button(text("×").size(12))
+                        .on_press(remove_message(i))
+                        .style(button::danger),
                 ]
-                .spacing(10)
-                .align_y(iced::Alignment::Center),
+                .spacing(8)
+                .align_y(Alignment::Center),
             );
         }
     }
@@ -456,12 +498,62 @@ fn list_section<'a>(
         text_input(placeholder, new_input)
             .on_input(on_input_change)
             .on_submit(add_message.clone())
+            .size(12)
             .width(Length::Fill),
-        button(text("Add")).on_press(add_message),
+        button(text("Add").size(12)).on_press(add_message),
     ]
-    .spacing(8);
+    .spacing(8)
+    .align_y(Alignment::Center);
 
-    column![text(label).size(16), list, add_row,]
-        .spacing(8)
+    column![text(label).size(13), list, add_row]
+        .spacing(6)
         .into()
+}
+
+fn per_window_section(form: &SettingsForm) -> Element<'_, app::Message> {
+    let header = text("Ignored windows (per-window)").size(13);
+    let hint = text(
+        "Specific windows matched by (process, title, class). Added via Win+I or the \
+         overview right-click \u{2192} \u{201C}Ignore this window\u{201D}.",
+    )
+    .size(10);
+
+    if form.ignored_window_titles.is_empty() {
+        return column![header, hint, text("(none)").size(11)]
+            .spacing(4)
+            .into();
+    }
+
+    let mut list = column![].spacing(2);
+    for (i, entry) in form.ignored_window_titles.iter().enumerate() {
+        let class_str = entry
+            .class
+            .as_deref()
+            .map_or_else(|| "(any class)".to_string(), |c| c.to_string());
+        let title_str = if entry.title.is_empty() {
+            "(empty title)".to_string()
+        } else {
+            entry.title.clone()
+        };
+
+        // Single-line compact: process · class · title · ×
+        list = list.push(
+            row![
+                text(entry.process.as_str()).size(11).width(Length::Fixed(120.0)),
+                text(class_str).size(11).width(Length::Fixed(200.0)),
+                text(title_str).size(11).width(Length::Fill),
+                button(text("×").size(11))
+                    .on_press(msg(SettingsMessage::RemoveIgnoredWindow(i)))
+                    .style(button::danger),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
+    }
+
+    column![header, hint, list].spacing(4).into()
+}
+
+fn msg(m: SettingsMessage) -> app::Message {
+    app::Message::Settings(m)
 }

@@ -187,6 +187,13 @@ impl app::State {
                     log::warn!("Failed to move source window offscreen: {e:#}");
                 }
             }
+            // We just moved every tile to a non-tile position. Drop the
+            // tiler's `last_layout` cache so when overview closes the
+            // next layout pass actually moves them back — otherwise the
+            // diff check sees no change vs the pre-overview rect and
+            // short-circuits, leaving the windows parked offscreen
+            // until the user scrolls by a pixel.
+            self.tiler.invalidate_last_layouts();
             log::info!("switching to Overview mode (per-monitor)");
             self.mode = Mode::Overview(State {
                 monitors: Vec::new(),
@@ -211,10 +218,20 @@ impl app::State {
         // Free-floating (non-tiled) windows are placed wherever the user
         // dragged them; we partition those by their actual current monitor.
         let tiling_hmonitor_now = self.tiling_hmonitor();
+        // Skip iconic (minimized) and cloaked (other virtual desktop)
+        // windows from the overview entirely — they have no on-screen
+        // pixels right now and a DWM thumbnail would render as a blank
+        // rectangle taking up a slot the user can't act on. Restore the
+        // window from the taskbar / Win+Tab if you want to overview it.
+        let is_overviewable = |w: &Window| -> bool {
+            !w.is_iconic() && !w.is_cloaked().unwrap_or(false)
+        };
         let mut on_this_monitor: Vec<Window> = Vec::new();
         if Some(hmonitor) == tiling_hmonitor_now {
             for item in self.tiler.windows() {
-                on_this_monitor.push(item.inner);
+                if is_overviewable(&item.inner) {
+                    on_this_monitor.push(item.inner);
+                }
             }
         }
         if let Ok(all_filtered) = crate::window::filter::all_managed_windows() {
@@ -224,7 +241,7 @@ impl app::State {
                 if tiled.contains(&w) {
                     continue;
                 }
-                if w.monitor() == hmonitor {
+                if w.monitor() == hmonitor && is_overviewable(&w) {
                     on_this_monitor.push(w);
                 }
             }
@@ -632,11 +649,16 @@ impl app::State {
         self.tiler.reorder(src, dst);
 
         // Only the tiling monitor's thumbnails reflect the tiler's order;
-        // recompute that monitor's layout in-place.
+        // recompute that monitor's layout in-place. Match the open-overview
+        // filter: skip iconic/cloaked so the strip layout doesn't leave a
+        // gap for a window that has no on-screen thumbnail to position.
         let strip_height = self.tiler.screen_size().height();
         let windows: Vec<thumbnail::WindowData> = self
             .tiler
             .windows()
+            .filter(|item| {
+                !item.inner.is_iconic() && !item.inner.is_cloaked().unwrap_or(false)
+            })
             .map(|item| thumbnail::WindowData {
                 inner: item.inner,
                 width: item.width,

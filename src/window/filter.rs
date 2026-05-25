@@ -26,6 +26,13 @@ const IGNORED_PROCESS_NAMES: &[&str] = &[
     "SnippingTool.exe",
     "PowerToys.PowerLauncher.exe",
     "Ditto.exe",
+    // Win11 Widgets panel (Win+W). Hosts the MSN news/weather feed.
+    // Cloaks/uncloaks aggressively (taskbar hover, hotkey, focus loss),
+    // so a passing visibility tick can otherwise drag it into the tiler
+    // as an "invisible block" titled "MSN" or similar.
+    "WidgetBoard.exe",
+    "WidgetService.exe",
+    "SpotifyWidgetProvider.exe",
 ];
 
 macro_rules! filter_out_if {

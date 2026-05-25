@@ -131,6 +131,47 @@ curl -X POST http://127.0.0.1:47812/scroll \
 curl -X POST http://127.0.0.1:47812/scroll -d '{"delta": -200}'
 ```
 
+### `POST /windows/{id}/resize`
+
+Smoothly (or instantly) resize the tile width for a tiled window. The same
+16ms animation tick that drives smooth scroll drives this — multiple
+resizes can be in flight at once.
+
+JSON body:
+
+| Field        | Type    | Meaning                                                              |
+| ------------ | ------- | -------------------------------------------------------------------- |
+| `width`      | number  | Target tile width in pixels (clamped to `[50, max_screen_width]`)    |
+| `animate_ms` | number  | Animation duration in ms; `0` (default) snaps instantly              |
+| `center`     | boolean | If true, also smooth-scroll so the window is centered at final width |
+
+```sh
+# Snap to 1600 px wide
+curl -X POST http://127.0.0.1:47812/windows/7405134/resize \
+     -H 'Content-Type: application/json' \
+     -d '{"width": 1600}'
+
+# Ease over 250 ms
+curl -X POST http://127.0.0.1:47812/windows/7405134/resize \
+     -H 'Content-Type: application/json' \
+     -d '{"width": 800, "animate_ms": 250}'
+
+# "Fullscreen this app": grow and center in one motion
+curl -X POST http://127.0.0.1:47812/windows/7405134/resize \
+     -H 'Content-Type: application/json' \
+     -d '{"width": 5100, "animate_ms": 250, "center": true}'
+```
+
+Easing is ease-out-cubic (snappy start, soft landing). Sending another
+resize while one is in flight replaces it — useful for a knob/encoder that
+streams a moving target. With `center: true`, the scroll target is computed
+against the *final* width (not the live interpolated one), so both
+animations finish at the same composed position.
+
+Returns 202 on accept; 400 if `width` isn't a positive finite number; 503
+if the API channel is closed. The command is a no-op (logged) if winri is
+in overview mode or the HWND isn't tracked by the tiler.
+
 ### `POST /action/{name}`
 
 Trigger any of the keyboard-equivalent actions. The action name is

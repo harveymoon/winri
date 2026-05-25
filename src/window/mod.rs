@@ -6,7 +6,7 @@ use std::{ffi::c_void, hash::Hash, thread, time::Duration};
 use anyhow::{Context, ensure};
 use windows::{
     Win32::{
-        Foundation::{HWND, LPARAM, RECT, WPARAM},
+        Foundation::{CloseHandle, HANDLE, HWND, LPARAM, RECT, WPARAM},
         Graphics::Dwm::{
             DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWINDOWATTRIBUTE, DwmGetWindowAttribute,
         },
@@ -32,6 +32,18 @@ use crate::{
 };
 
 pub type SafeHWND = u64;
+
+/// RAII closer for an `OpenProcess` HANDLE. Dropping it calls `CloseHandle`
+/// so the handle is released on every path including early-returns.
+struct ProcessHandleGuard(HANDLE);
+
+impl Drop for ProcessHandleGuard {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Window {
@@ -92,7 +104,13 @@ pub fn batch_move_windows(moves: &[BatchMove]) -> anyhow::Result<()> {
     let mut hdwp: HDWP = unsafe {
         BeginDeferWindowPos(i32::try_from(validated.len()).unwrap_or(i32::MAX))
     }
-    .context("BeginDeferWindowPos")?;
+    .with_context(|| {
+        format!(
+            "BeginDeferWindowPos failed (count={}, flags=0x{:08x})",
+            validated.len(),
+            flags.0
+        )
+    })?;
 
     // Track where we got to so we can fall back per-window from there.
     let mut failed_at: Option<usize> = None;
@@ -102,9 +120,21 @@ pub fn batch_move_windows(moves: &[BatchMove]) -> anyhow::Result<()> {
         } {
             Ok(updated) => hdwp = updated,
             Err(e) => {
+                // Diagnostic detail: which exact HWND/rect/flag combination
+                // the OS rejected. Until we see this in the wild we can't
+                // narrow E_INVALIDARG (0x80070057) to a specific cause.
                 log::warn!(
-                    "DeferWindowPos failed for HWND {:?} ({e}); committing prior moves and falling back per-window",
-                    mv.hwnd
+                    "DeferWindowPos rejected hwnd={:?} pos=({}, {}) size=({}, {}) flags=0x{:08x} batch_idx={}/{} batch_size={} err={} — committing prior moves, falling back per-window",
+                    mv.hwnd,
+                    mv.x,
+                    mv.y,
+                    mv.width,
+                    mv.height,
+                    flags.0,
+                    i,
+                    validated.len().saturating_sub(1),
+                    validated.len(),
+                    e,
                 );
                 failed_at = Some(i);
                 break;
@@ -125,7 +155,10 @@ pub fn batch_move_windows(moves: &[BatchMove]) -> anyhow::Result<()> {
             if let Err(e) = unsafe {
                 SetWindowPos(mv.hwnd, None, mv.x, mv.y, mv.width, mv.height, flags)
             } {
-                log::warn!("Per-window SetWindowPos fallback failed for {:?}: {e}", mv.hwnd);
+                log::warn!(
+                    "Per-window SetWindowPos fallback rejected hwnd={:?} pos=({}, {}) size=({}, {}) flags=0x{:08x} err={}",
+                    mv.hwnd, mv.x, mv.y, mv.width, mv.height, flags.0, e,
+                );
             }
         }
     }
@@ -310,6 +343,10 @@ impl Window {
             false,
             process_id,
         ))?;
+        // RAII guard: this fn is called from every snapshot's filter pass
+        // (per-window per-tick) plus logging and API state publish. Without
+        // a close on every path winri leaked ~100 process handles/sec.
+        let _guard = ProcessHandleGuard(process);
 
         let mut process_name = vec![0u16; 256];
 
@@ -433,12 +470,20 @@ impl Window {
         bottom: i32,
     ) -> anyhow::Result<()> {
         ensure_valid!(self);
-        use windows::Win32::Graphics::Gdi::{CreateRectRgn, SetWindowRgn};
+        use windows::Win32::Graphics::Gdi::{CreateRectRgn, DeleteObject, HGDIOBJ, SetWindowRgn};
         let hrgn = unsafe { CreateRectRgn(left, top, right, bottom) };
         if hrgn.is_invalid() {
             return Err(anyhow::anyhow!("CreateRectRgn returned NULL"));
         }
-        let _ = unsafe { SetWindowRgn(self.handle(), Some(hrgn), true) };
+        // SetWindowRgn transfers ownership of `hrgn` to the OS only on
+        // success (non-zero return). On failure (zero return) the OS does
+        // NOT take it and we must DeleteObject ourselves or we leak a
+        // GDI handle per failed call.
+        let result = unsafe { SetWindowRgn(self.handle(), Some(hrgn), true) };
+        if result == 0 {
+            let _ = unsafe { DeleteObject(HGDIOBJ(hrgn.0)) };
+            return Err(anyhow::anyhow!("SetWindowRgn returned 0"));
+        }
         Ok(())
     }
 

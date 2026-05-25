@@ -12,6 +12,17 @@ use log::{debug, info, warn};
 
 use crate::{cast, utils::math::Size, window::Window};
 
+/// In-flight smooth width transition. Driven by `ScrollTiler::tick_animation`
+/// in the same 16ms loop that scroll smoothing uses. Cleared when elapsed
+/// exceeds duration; `target_width` is then committed exactly.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WidthAnimation {
+    pub start_width: f32,
+    pub target_width: f32,
+    pub start_time: Instant,
+    pub duration: Duration,
+}
+
 /// Represents a window managed by the tiler.
 #[derive(PartialEq)]
 pub struct WindowItem {
@@ -36,6 +47,10 @@ pub struct WindowItem {
     /// when to call `SetWindowRgn(None)` on the transition back to full
     /// visibility.
     last_clip: Option<(i32, i32, i32, i32)>,
+    /// Active smooth-resize animation, if any. Set by
+    /// `ScrollTiler::animate_window_width` (driven from the HTTP API's
+    /// `POST /windows/<id>/resize`). Advanced each frame by `tick_animation`.
+    width_animation: Option<WidthAnimation>,
 }
 
 impl WindowItem {
@@ -46,6 +61,7 @@ impl WindowItem {
             width,
             last_layout: None,
             last_clip: None,
+            width_animation: None,
         }
     }
 
@@ -126,9 +142,13 @@ impl ScrollTiler {
         self.smooth_scroll_factor = factor.clamp(0.05, 1.0);
     }
 
-    /// Whether a smoothing animation is currently in progress.
-    pub const fn is_animating(&self) -> bool {
+    /// Whether any smoothing animation is currently in progress —
+    /// scroll smoothing or any per-window width animation. Drives the
+    /// 16ms iced redraw subscription so `tick_animation` keeps firing
+    /// until everything settles.
+    pub fn is_animating(&self) -> bool {
         self.scroll_target.is_some()
+            || self.windows.iter().any(|w| w.width_animation.is_some())
     }
 
     /// How long ago anything in the strip last moved. `None` until the
@@ -183,24 +203,116 @@ impl ScrollTiler {
         self.padding.mul_add(2.0, inner)
     }
 
-    /// Advance the smoothing animation by one frame. Returns whether the
-    /// animation is still running (so the caller can decide whether to keep
-    /// ticking).
+    /// Advance every in-flight animation (scroll smoothing + per-window
+    /// width animations) by one frame. Returns whether any animation is
+    /// still running so the caller can decide whether to keep ticking.
     pub fn tick_animation(&mut self) -> bool {
-        let Some(target) = self.scroll_target else {
+        let mut moved = false;
+
+        // Scroll smoothing.
+        if let Some(target) = self.scroll_target {
+            let diff = target - self.scroll_offset;
+            if diff.abs() < 0.5 {
+                self.scroll_offset = target;
+                self.scroll_target = None;
+            } else {
+                self.scroll_offset += diff * self.smooth_scroll_factor;
+            }
+            moved = true;
+        }
+
+        // Per-window width animations. Time-based (Instant) so they finish
+        // in the requested wall-clock duration regardless of frame jitter.
+        let now = Instant::now();
+        for item in &mut self.windows {
+            let Some(anim) = item.width_animation.clone() else {
+                continue;
+            };
+            let elapsed = now.saturating_duration_since(anim.start_time);
+            if elapsed >= anim.duration {
+                // Snap to target and clear.
+                item.width = anim.target_width;
+                item.requested_width = Some(anim.target_width);
+                item.width_animation = None;
+            } else {
+                let dur = anim.duration.as_secs_f32().max(1e-3);
+                let t = (elapsed.as_secs_f32() / dur).clamp(0.0, 1.0);
+                // Ease-out-cubic: quick start, soft landing.
+                let eased = 1.0 - (1.0 - t).powi(3);
+                let new_width = anim.start_width + (anim.target_width - anim.start_width) * eased;
+                item.width = new_width;
+                item.requested_width = Some(new_width);
+            }
+            moved = true;
+        }
+
+        if moved {
+            let positions = self.windows_positions();
+            self.layout_windows(&positions);
+            self.mark_motion();
+        }
+
+        self.is_animating()
+    }
+
+    /// Begin a smooth scroll so the window with the given HWND ends up
+    /// centered in the viewport at `assumed_width`. Use `assumed_width =
+    /// target_width` when chaining with `animate_window_width` so the
+    /// final centered position is correct even though the live width is
+    /// still mid-interpolation. Returns `false` if the HWND isn't tracked.
+    pub fn center_window_at_width(&mut self, hwnd_raw: u64, assumed_width: f32) -> bool {
+        let Some(idx) = self
+            .windows
+            .iter()
+            .position(|w| w.inner.handle().0 as u64 == hwnd_raw)
+        else {
             return false;
         };
-        let diff = target - self.scroll_offset;
-        if diff.abs() < 0.5 {
-            self.scroll_offset = target;
-            self.scroll_target = None;
-        } else {
-            self.scroll_offset += diff * self.smooth_scroll_factor;
-        }
         let positions = self.windows_positions();
-        self.layout_windows(&positions);
-        self.mark_motion();
-        self.scroll_target.is_some()
+        let Some(&strip_x) = positions.get(idx) else {
+            return false;
+        };
+        let max_w = self.max_screen_width();
+        let clamped = assumed_width.clamp(50.0, max_w);
+        let target = strip_x + clamped / 2.0 - self.screen_size.width() / 2.0;
+        self.set_scroll_offset(target);
+        true
+    }
+
+    /// Begin a smooth width animation for the window with the given HWND.
+    /// `duration_ms == 0` applies the new width immediately and cancels
+    /// any in-flight animation for that window. The target is clamped to
+    /// `[50, max_screen_width]` so callers can't accidentally hide or
+    /// over-grow a tile. Returns `false` if no tiled window with that
+    /// HWND exists.
+    pub fn animate_window_width(
+        &mut self,
+        hwnd_raw: u64,
+        target_width: f32,
+        duration_ms: u32,
+    ) -> bool {
+        let max_w = self.max_screen_width();
+        let target = target_width.clamp(50.0, max_w);
+        let Some(item) = self
+            .windows
+            .iter_mut()
+            .find(|w| w.inner.handle().0 as u64 == hwnd_raw)
+        else {
+            return false;
+        };
+        if duration_ms == 0 {
+            item.width = target;
+            item.requested_width = Some(target);
+            item.width_animation = None;
+        } else {
+            item.width_animation = Some(WidthAnimation {
+                start_width: item.width,
+                target_width: target,
+                start_time: Instant::now(),
+                duration: Duration::from_millis(u64::from(duration_ms)),
+            });
+        }
+        true
     }
 
     fn focus_index(&self) -> Option<usize> {
@@ -240,6 +352,18 @@ impl ScrollTiler {
 
     pub fn windows(&self) -> impl Iterator<Item = &WindowItem> {
         self.windows.iter()
+    }
+
+    /// Forget every tracked window's last laid-out rect. Call after some
+    /// code path outside `layout_windows` has moved the windows (e.g.
+    /// overview's `move_offscreen` parks every tile when the user opens
+    /// overview). Without this, the next `layout_windows` pass sees
+    /// `last_layout` matches the new target and short-circuits the move
+    /// — leaving the windows wherever the external code last put them.
+    pub fn invalidate_last_layouts(&mut self) {
+        for w in &mut self.windows {
+            w.last_layout = None;
+        }
     }
 
     /// Scroll the tile strip horizontally by `delta_px`. Positive values
@@ -317,6 +441,29 @@ impl ScrollTiler {
         (focus_index + direction).clamp(0, windows_len - 1) as usize
     }
 
+    /// Walk `direction` (-1 or +1) from `start` skipping any iconic or
+    /// cloaked windows. Used for focus stepping so Win+←/→ never lands on
+    /// a window the user can't actually see — landing on a cloaked window
+    /// causes the OS to switch virtual desktops on `SetForegroundWindow`,
+    /// which the user explicitly does *not* want when cycling focus on
+    /// the current desktop's strip. Returns `None` if no visible neighbor
+    /// exists in that direction (in which case caller should no-op).
+    fn next_visible_index(&self, start: usize, direction: i32) -> Option<usize> {
+        if self.windows.is_empty() {
+            return None;
+        }
+        let len = self.windows.len() as i32;
+        let mut idx = start as i32 + direction;
+        while idx >= 0 && idx < len {
+            let item = &self.windows[idx as usize];
+            if !item.inner.is_iconic() && !item.inner.is_cloaked().unwrap_or(false) {
+                return Some(idx as usize);
+            }
+            idx += direction;
+        }
+        None
+    }
+
     fn swap_current(&mut self, direction: i32) {
         if let Some(focus_index) = self.logged_focus_index() {
             let other_swap_index = self.compute_index_for_direction(focus_index, direction);
@@ -334,7 +481,11 @@ impl ScrollTiler {
 
     fn focus(&self, direction: i32) {
         if let Some(focus_index) = self.focus_index_with_fallback_and_log() {
-            let new_focus_index = self.compute_index_for_direction(focus_index, direction);
+            let Some(new_focus_index) = self.next_visible_index(focus_index, direction) else {
+                // Nothing visible in that direction — no-op rather than
+                // wrap or land on something the user can't see.
+                return;
+            };
             let window = self.windows[new_focus_index].inner;
 
             let _ = window
@@ -426,8 +577,23 @@ impl ScrollTiler {
         // a scroll pushed a window's center past the monitor edge. The
         // dedicated drag-end check below handles real "user moved this to
         // another monitor" events.
-        self.windows
-            .retain(|item| windows_snapshot.contains(&item.inner));
+        //
+        // Virtual-desktop survival: a window that cloaked because the
+        // user switched to another Windows virtual desktop (Win+Ctrl+→,
+        // 3-finger touchpad swipe, Task View click-through) drops out of
+        // the snapshot. Without this we'd lose every tiled window on a
+        // desktop switch and re-append them in arbitrary order with
+        // default widths when the user came back. Keep cloaked-but-valid
+        // HWNDs in the tiler so positions, widths, and order all survive
+        // the round trip.
+        self.windows.retain(|item| {
+            if windows_snapshot.contains(&item.inner) {
+                return true;
+            }
+            // Still a real HWND and only "missing" because cloaked? Keep.
+            item.inner.is_valid().unwrap_or(false)
+                && item.inner.is_cloaked().unwrap_or(false)
+        });
 
         // Drag-end detection. If the user was holding left mouse last
         // snapshot and isn't now, they just released. A tiled window
@@ -442,42 +608,123 @@ impl ScrollTiler {
             /// How far a window must have drifted from its last laid-out
             /// position to count as "user dragged" rather than tiler-placed.
             const DRAG_DETECT_PX: f32 = 50.0;
-            let before = self.windows.len();
-            self.windows.retain(|item| {
-                let on_tiling = item.inner.monitor() == tiling_hmonitor;
-                if on_tiling {
-                    return true;
-                }
-                let Some((lx, ly, _, _)) = item.last_layout else {
-                    // No baseline → trust the existing behavior and keep
-                    // the window. Will be reassessed next snapshot.
-                    return true;
-                };
-                let drifted = match item.inner.desktop_manager_bounds().ok() {
-                    Some(bounds) => {
-                        let pos = bounds.position();
-                        (pos.x() - lx).abs() > DRAG_DETECT_PX
-                            || (pos.y() - ly).abs() > DRAG_DETECT_PX
+            /// A human can only drag one window per mouse-release. If many
+            /// windows simultaneously look "off-monitor + drifted" the
+            /// layout system is desynced from reality (e.g. SetWindowPos
+            /// was silently failing all session) — refuse to prune and let
+            /// the next snapshot re-stabilise. Empirically chosen: 2
+            /// allows a small amount of noise but rejects the runaway case
+            /// that flattened the tiler from 14→0 in one click.
+            const DRAG_PRUNE_CAP: usize = 2;
+
+            // First pass: collect candidates without mutating self.windows.
+            let candidates: Vec<usize> = self
+                .windows
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, item)| {
+                    if item.inner.monitor() == tiling_hmonitor {
+                        return None;
                     }
-                    None => false,
-                };
-                if drifted {
+                    // Cloaked windows are on another virtual desktop —
+                    // their position is meaningless to the drag-end check.
+                    if item.inner.is_cloaked().unwrap_or(false) {
+                        return None;
+                    }
+                    let (lx, ly, _, _) = item.last_layout?;
+                    let bounds = item.inner.desktop_manager_bounds().ok()?;
+                    let pos = bounds.position();
+                    let drifted = (pos.x() - lx).abs() > DRAG_DETECT_PX
+                        || (pos.y() - ly).abs() > DRAG_DETECT_PX;
+                    drifted.then_some(idx)
+                })
+                .collect();
+
+            if candidates.len() > DRAG_PRUNE_CAP {
+                warn!(
+                    "Drag-end: {} window(s) appear off-tiling-monitor + drifted (cap {}). \
+                     Treating as layout desync, not user drag; no windows untiled. \
+                     HWNDs: {:?}",
+                    candidates.len(),
+                    DRAG_PRUNE_CAP,
+                    candidates
+                        .iter()
+                        .map(|&i| self.windows[i].inner.handle())
+                        .collect::<Vec<_>>(),
+                );
+            } else if !candidates.is_empty() {
+                for &idx in &candidates {
+                    let item = &self.windows[idx];
                     info!(
                         "Drag-end: window {:?} moved to monitor {} and drifted from layout; untiling",
                         item.inner.handle(),
                         item.inner.monitor(),
                     );
-                    false
-                } else {
-                    true
                 }
-            });
-            if before != self.windows.len() {
+                // Remove highest-indexed first so earlier indices stay valid.
+                let mut to_remove = candidates;
+                to_remove.sort_unstable_by(|a, b| b.cmp(a));
+                let before = self.windows.len();
+                for idx in to_remove {
+                    self.windows.remove(idx);
+                }
                 info!(
                     "Drag-end pruned {} window(s); {} remain tiled",
                     before - self.windows.len(),
                     self.windows.len()
                 );
+            }
+
+            // Left-edge resize detection. The strip is left-anchored, so if
+            // the user dragged the left edge of the focused window we'd
+            // normally re-pin its left edge and let the right edge fly off.
+            // The user wants the right edge to stay visually fixed instead.
+            // Pattern: width changed AND `actual.x` shifted by approximately
+            // `-dw` (i.e. right edge stayed put). Compensate by nudging
+            // scroll_offset by `dw` so layout_windows re-places the window
+            // at the exact bounds the user left it at — zero visible jump.
+            // Neighbors are NEVER squished or expanded by user choice.
+            if let Some(focus_idx) = self.focus_index() {
+                if let Some((lx, _ly, lw, _lh)) = self.windows[focus_idx].last_layout {
+                    if let Ok(bounds) =
+                        self.windows[focus_idx].inner.desktop_manager_bounds()
+                    {
+                        let pw = bounds.size().width();
+                        let px = bounds.position().x();
+                        let dw = pw - lw;
+                        let dx = px - lx;
+                        // Right edge stays put iff dx ≈ -dw. Noise floor
+                        // catches sub-pixel/DWM jitter without burning on
+                        // borderline gestures.
+                        const RESIZE_NOISE_PX: f32 = 5.0;
+                        let is_left_edge_resize =
+                            dw.abs() > RESIZE_NOISE_PX && (dx + dw).abs() < RESIZE_NOISE_PX;
+                        if is_left_edge_resize {
+                            /// Smallest tile width allowed. A user dragging
+                            /// past this floor snaps to it; the right edge
+                            /// still doesn't move (scroll compensates by
+                            /// the clamped delta, not the raw drag delta).
+                            const MIN_TILE_WIDTH: f32 = 200.0;
+                            let max_w = self.max_screen_width();
+                            let clamped = pw.clamp(MIN_TILE_WIDTH, max_w);
+                            let effective_dw = clamped - lw;
+                            // Direct (not smooth) scroll so the right edge
+                            // doesn't visibly drift while a smoothing
+                            // animation chases the target.
+                            self.scroll_offset += effective_dw;
+                            self.scroll_target = None;
+                            self.windows[focus_idx].requested_width = Some(clamped);
+                            info!(
+                                "Left-edge resize: focused HWND {:?} width {:.0} -> {:.0} (drag-actual {:.0}), scroll compensated {:+.0}",
+                                self.windows[focus_idx].inner.handle(),
+                                lw,
+                                clamped,
+                                pw,
+                                effective_dw,
+                            );
+                        }
+                    }
+                }
             }
         }
 
@@ -496,12 +743,44 @@ impl ScrollTiler {
         let focus_changed = current_focus != self.previously_focused_window_index;
         if focus_changed {
             let previous_scroll_offset = self.scroll_offset;
-            self.ajust_scroll(&windows_positions);
-            if (previous_scroll_offset - self.scroll_offset).abs() > 1.0 {
-                debug!(
-                    "Adjusted scroll on focus change: {} -> {}",
-                    previous_scroll_offset, self.scroll_offset
-                );
+            // When the strip has been fundamentally repacked (e.g. user
+            // just switched virtual desktops and a different subset of
+            // windows is now non-cloaked), the new focused window is
+            // typically far outside the viewport the old scroll_offset
+            // was set for. `adjust_scroll` would nudge incrementally and
+            // potentially land on empty desktop. Detect "focused window
+            // is more than half a viewport from any visible edge" and
+            // center on it instead.
+            let should_center = current_focus.is_some_and(|idx| {
+                if idx >= windows_positions.len() {
+                    return false;
+                }
+                let pos = windows_positions[idx];
+                let w = self.windows[idx].width;
+                let view_left = self.scroll_offset;
+                let view_right = self.scroll_offset + self.screen_size.width();
+                let half_screen = self.screen_size.width() / 2.0;
+                pos > view_right + half_screen || (pos + w) < view_left - half_screen
+            });
+            if should_center {
+                if let Some(idx) = current_focus {
+                    let pos = windows_positions[idx];
+                    let w = self.windows[idx].width;
+                    let target = pos + w / 2.0 - self.screen_size.width() / 2.0;
+                    self.set_scroll_offset(target);
+                    debug!(
+                        "Recentered scroll on focus change (post-repack): {} -> {}",
+                        previous_scroll_offset, self.scroll_offset
+                    );
+                }
+            } else {
+                self.ajust_scroll(&windows_positions);
+                if (previous_scroll_offset - self.scroll_offset).abs() > 1.0 {
+                    debug!(
+                        "Adjusted scroll on focus change: {} -> {}",
+                        previous_scroll_offset, self.scroll_offset
+                    );
+                }
             }
         }
         self.layout_windows(&windows_positions);
@@ -593,10 +872,20 @@ impl ScrollTiler {
         let monitor_height = self.screen_size.height();
 
         // Park coordinates for windows that are completely outside the
-        // tiling monitor. Chosen to be well outside any realistic
-        // virtual-screen layout.
-        const PARK_X: f32 = 100_000.0;
-        const PARK_Y: f32 = 100_000.0;
+        // tiling monitor. Chosen to be:
+        //   - Well outside any realistic virtual-screen layout (≥ 25k px
+        //     comfortably exceeds 4× 8K monitors side-by-side),
+        //   - **Inside `i16::MAX` (32767)** because Chromium-based apps
+        //     (Chrome, Discord, VS Code, Electron, etc.) clamp SetWindowPos
+        //     coordinates to signed-16-bit via WM_WINDOWPOSCHANGING — even
+        //     when we set SWP_NOSENDCHANGING the app's internal hooks
+        //     still rebound the move. A park value > 32767 silently lands
+        //     the window at (32767, 32767) while our `last_layout` cache
+        //     records the intended (100000, 100000); the window is then
+        //     stranded because the cache reports "no change needed" on
+        //     every subsequent layout pass.
+        const PARK_X: f32 = 25_000.0;
+        const PARK_Y: f32 = 25_000.0;
 
         // Per-frame decision for each window: what rect to move it to,
         // whether to apply a clip, and what clip rect. We compute these
@@ -623,6 +912,12 @@ impl ScrollTiler {
 
         for (idx, (window, x)) in self.windows.iter().zip(windows_positions).enumerate() {
             if window.inner.is_iconic() {
+                continue;
+            }
+            // Cloaked = on another virtual desktop. Skip layout entirely
+            // — moving an invisible window wastes a SetWindowPos call and
+            // can race with the shell's own cloak-driven repositioning.
+            if window.inner.is_cloaked().unwrap_or(false) {
                 continue;
             }
             let target_x = x - self.scroll_offset;
@@ -723,12 +1018,33 @@ impl ScrollTiler {
                 Some((d.place_x, d.place_y, d.target_w, d.target_h));
         }
 
-        // Clip pass. Skip entirely while animating: SetWindowRgn forces a
-        // per-call DWM frame redraw, which dominates the per-tick cost
-        // for apps with custom title bars. We accept transient pixel
-        // spillover during the slide and re-apply clips on the next
-        // non-animating layout (which runs once the animation settles).
-        if !animating {
+        // Clip pass.
+        //
+        // During animation we actively *clear* every existing clip on the
+        // first frame so windows render full-width while the strip is
+        // moving — the previous behaviour ("skip clip changes while
+        // animating") left stale clip rects in place, which the user saw
+        // as a "clipped plane scrolling inwards then snapping the second
+        // half of the window into view at settle". Per explicit user
+        // direction we accept transient strip spillover onto the
+        // secondary monitor during the slide and handle the overflow
+        // some other way later.
+        //
+        // After the first animation frame, every `last_clip` is `None`
+        // and the inner check makes subsequent frames effectively
+        // no-ops. On settle (`!animating`), we re-evaluate and apply the
+        // correct clip for the resting state.
+        if animating {
+            for d in &decisions {
+                let item = &mut self.windows[d.idx];
+                if item.last_clip.is_some() {
+                    if let Err(e) = item.inner.clear_visible_region() {
+                        warn!("clear_visible_region (scroll-start clear) failed: {e}");
+                    }
+                    item.last_clip = None;
+                }
+            }
+        } else {
             for d in &decisions {
                 let item = &mut self.windows[d.idx];
                 if d.fully_offscreen {
@@ -768,6 +1084,11 @@ impl ScrollTiler {
         for window in &mut self.windows {
             if let Some(requested_width) = window.requested_width() {
                 window.width = requested_width;
+            } else if window.inner.is_cloaked().unwrap_or(false) {
+                // Cloaked = on another virtual desktop. desktop_manager_bounds
+                // for these can return stale/zeroed data; preserve the
+                // last-known visible width so it's correct when un-cloaked.
+                continue;
             } else if let Ok(bounds) = window
                 .inner
                 .desktop_manager_bounds()
@@ -822,7 +1143,16 @@ impl ScrollTiler {
         let mut positions = Vec::new();
         let mut current_position = 0.0;
 
+        // Cloaked (other virtual desktop) and iconic (minimized) windows
+        // contribute zero strip space so the visible windows pack tight
+        // — no empty gap where a minimized tile used to live. We still
+        // emit one position per WindowItem (sentinel = current cursor)
+        // so the returned vector indices stay aligned with `self.windows`.
         for window in &self.windows {
+            if window.inner.is_cloaked().unwrap_or(false) || window.inner.is_iconic() {
+                positions.push(current_position);
+                continue;
+            }
             current_position += self.padding;
             positions.push(current_position);
             current_position += window.width + self.padding;

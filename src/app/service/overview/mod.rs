@@ -34,12 +34,6 @@ pub struct State {
 pub struct MonitorOverview {
     pub window_id: iced::window::Id,
     pub hmonitor: isize,
-    /// Monitor work-area origin in virtual-screen coords (can be negative
-    /// when secondary monitor is left of primary). Stored so we know where
-    /// to position the iced window when we open it.
-    pub origin: (f32, f32),
-    /// Monitor work-area size in pixels.
-    pub size: (f32, f32),
     /// Live DWM thumbnails in display order for this monitor.
     pub thumbnails: Vec<Thumbnail>,
     pub cursor_pos: Option<iced::Point>,
@@ -350,18 +344,9 @@ impl app::State {
         let Mode::Overview(state) = &mut self.mode else {
             unreachable!("set above");
         };
-        #[allow(clippy::cast_precision_loss)]
         state.monitors.push(MonitorOverview {
             window_id: overview_window_id,
             hmonitor,
-            origin: (
-                monitor_info.work_area.left as f32,
-                monitor_info.work_area.top as f32,
-            ),
-            size: (
-                monitor_info.work_area_width() as f32,
-                monitor_info.work_area_height() as f32,
-            ),
             thumbnails,
             cursor_pos: None,
             press_pos: None,

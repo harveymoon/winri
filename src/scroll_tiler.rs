@@ -51,6 +51,14 @@ pub struct WindowItem {
     /// `ScrollTiler::animate_window_width` (driven from the HTTP API's
     /// `POST /windows/<id>/resize`). Advanced each frame by `tick_animation`.
     width_animation: Option<WidthAnimation>,
+    /// Actual on-screen position observed at the previous snapshot tick.
+    /// Used by the position-divergence defense to distinguish "window
+    /// just moved (and is now divergent from our cache)" from "window
+    /// has been stuck in its divergent position since last tick" — we
+    /// only invalidate `last_layout` on the transition, never in a busy
+    /// loop, so an app that persistently rejects our SetWindowPos can't
+    /// keep us calling SetWindowPos every snapshot.
+    last_observed_pos: Option<(f32, f32)>,
 }
 
 impl WindowItem {
@@ -62,6 +70,7 @@ impl WindowItem {
             last_layout: None,
             last_clip: None,
             width_animation: None,
+            last_observed_pos: None,
         }
     }
 
@@ -675,6 +684,13 @@ impl ScrollTiler {
                 );
             }
 
+            // (Left-edge resize detection follows.)
+            //
+            // Below this block (still inside the `drag_just_ended` arm) we'll
+            // also pick up width-only resizes by the right-edge handler — but
+            // that one doesn't need scroll comp, so it's just the existing
+            // update_widths + layout_windows flow.
+
             // Left-edge resize detection. The strip is left-anchored, so if
             // the user dragged the left edge of the focused window we'd
             // normally re-pin its left edge and let the right edge fly off.
@@ -724,6 +740,74 @@ impl ScrollTiler {
                             );
                         }
                     }
+                }
+            }
+        }
+
+        // Position-divergence defense.
+        //
+        // The tiler's `last_layout` cache trusts that the OS applied our
+        // SetWindowPos calls. Multiple bugs this session were the same
+        // shape: the OS silently rejected or clamped a move (Chrome's
+        // i16 coordinate clamp, app-side WM_WINDOWPOSCHANGING handlers,
+        // user dragging a tile slightly within the strip), our cache
+        // said "already at target" and the diff-skip in layout_windows
+        // never re-issued the move.
+        //
+        // Catch every flavour of this: on every snapshot tick where the
+        // mouse isn't held, compare each non-iconic non-cloaked window's
+        // actual screen position against `last_layout`. If they differ
+        // by more than the noise floor AND the window has *moved since
+        // last tick*, invalidate `last_layout` so the next pass actually
+        // re-issues the SetWindowPos. The "moved since last tick" gate
+        // is critical: an app that persistently rejects our move (stuck
+        // divergent state) won't trigger a busy-loop of SetWindowPos
+        // every tick. We only act on the transition.
+        if !mouse_held_now {
+            const DIVERGENCE_PX: f32 = 5.0;
+            const MOVEMENT_NOISE_PX: f32 = 1.0;
+            for item in &mut self.windows {
+                if item.inner.is_iconic() || item.inner.is_cloaked().unwrap_or(false) {
+                    // Don't track observed positions for hidden windows —
+                    // their last_observed_pos is meaningless and could
+                    // trigger a spurious "moved" detection on un-cloak.
+                    item.last_observed_pos = None;
+                    continue;
+                }
+                let Ok(bounds) = item.inner.desktop_manager_bounds() else {
+                    continue;
+                };
+                let pos = bounds.position();
+                let now_pos = (pos.x(), pos.y());
+                let last_obs = item.last_observed_pos;
+                item.last_observed_pos = Some(now_pos);
+
+                let moved_since_last = match last_obs {
+                    Some((ox, oy)) => {
+                        (now_pos.0 - ox).abs() > MOVEMENT_NOISE_PX
+                            || (now_pos.1 - oy).abs() > MOVEMENT_NOISE_PX
+                    }
+                    None => false,
+                };
+                if !moved_since_last {
+                    continue;
+                }
+
+                let Some((lx, ly, _lw, _lh)) = item.last_layout else {
+                    continue;
+                };
+                let diverged = (now_pos.0 - lx).abs() > DIVERGENCE_PX
+                    || (now_pos.1 - ly).abs() > DIVERGENCE_PX;
+                if diverged {
+                    debug!(
+                        "Position divergence on {:?}: actual=({:.0},{:.0}) cache=({:.0},{:.0}) — forcing re-issue",
+                        item.inner.handle(),
+                        now_pos.0,
+                        now_pos.1,
+                        lx,
+                        ly,
+                    );
+                    item.last_layout = None;
                 }
             }
         }

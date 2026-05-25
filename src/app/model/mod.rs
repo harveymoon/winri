@@ -1,7 +1,6 @@
 #[derive(Clone, Copy)]
 pub struct BorderStyle {
     pub color: iced::Color,
-    pub thickness: f32,
     pub radius: f32,
 }
 

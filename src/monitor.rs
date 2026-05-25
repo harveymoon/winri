@@ -5,7 +5,6 @@
 //! them on hotplug / DPI changes), so anything user-visible (config, API)
 //! should reference monitors by `device_name` instead (e.g. `\\.\DISPLAY1`).
 
-use std::ffi::c_void;
 
 use anyhow::{Context, anyhow};
 use windows::Win32::{
@@ -28,8 +27,6 @@ pub struct Monitor {
     /// Stable device name like `\\.\DISPLAY1`. Use this as the cross-run
     /// identifier in config and the API.
     pub device_name: String,
-    /// Full monitor rect in virtual-screen coordinates (can be negative).
-    pub monitor_rect: RECT,
     /// Work area (excludes the taskbar) in virtual-screen coordinates.
     pub work_area: RECT,
     pub is_primary: bool,
@@ -78,7 +75,6 @@ pub fn enumerate() -> Vec<Monitor> {
         out.push(Monitor {
             hmonitor: hmonitor.0 as isize,
             device_name,
-            monitor_rect: info.monitorInfo.rcMonitor,
             work_area: info.monitorInfo.rcWork,
             is_primary,
         });
@@ -96,10 +92,6 @@ pub fn enumerate() -> Vec<Monitor> {
     }
 
     out
-}
-
-pub fn primary() -> Option<Monitor> {
-    enumerate().into_iter().find(|m| m.is_primary)
 }
 
 pub fn find_by_device_name(name: &str) -> Option<Monitor> {
@@ -140,13 +132,6 @@ pub fn resolve_tiling_monitor(config_value: &str) -> anyhow::Result<Monitor> {
 /// `isize` for cross-thread storage.
 pub fn monitor_of_hwnd(hwnd: HWND) -> isize {
     unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST).0 as isize }
-}
-
-/// Convenience: `monitor_of_hwnd(hwnd)` taking a raw `u64` (the HWND
-/// representation used by the rest of winri). Used internally; callers
-/// should generally prefer the typed variant.
-pub fn monitor_of_raw_hwnd(raw: u64) -> isize {
-    monitor_of_hwnd(HWND(raw as *mut c_void))
 }
 
 fn read_wide_nul_terminated(buf: &[u16]) -> String {

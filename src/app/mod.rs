@@ -169,7 +169,6 @@ impl State {
                 configuration: model::Configuration {
                     tiler_border_style: model::BorderStyle {
                         color: system::highlight_color().unwrap(),
-                        thickness: 4.0,
                         radius: 8.0,
                     },
                 },
@@ -290,7 +289,7 @@ impl State {
     }
 
     fn handle_api_command(&mut self, command: crate::api::ApiCommand) -> Task<Message> {
-        use crate::api::{ApiCommand, NamedAction};
+        use crate::api::ApiCommand;
 
         match command {
             ApiCommand::Focus(hwnd_raw) => {

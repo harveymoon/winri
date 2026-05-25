@@ -14,6 +14,7 @@
 //!   system and dispatches as a `Message::Api(...)`.
 
 mod capture;
+mod events;
 mod server;
 mod types;
 
@@ -90,11 +91,72 @@ fn state_slot() -> &'static RwLock<ApiState> {
 }
 
 /// Update the snapshot read by API consumers. Called by the main thread
-/// whenever the tiler state changes.
+/// whenever the tiler state changes. Also fans out a serialized snapshot
+/// to any open SSE subscribers — `events::publish` itself diff-suppresses
+/// byte-identical payloads, so animation-tick spam at 60Hz doesn't reach
+/// clients.
 pub fn publish_state(state: ApiState) {
+    // Build the public StateResponse before we drop ownership of `state`
+    // — both /state's request handler and the SSE channel emit this
+    // exact JSON.
+    let response = build_state_response(&state);
     *state_slot()
         .write()
         .expect("api state rwlock poisoned") = state;
+    if let Ok(json) = serde_json::to_string(&response) {
+        events::publish(json);
+    }
+}
+
+/// Map the internal `ApiState` to the public `StateResponse` JSON shape.
+/// Shared by `GET /state` (request-time) and event publication so the
+/// two never drift.
+pub(crate) fn build_state_response(state: &ApiState) -> types::StateResponse {
+    let windows = state
+        .windows
+        .iter()
+        .map(|w| types::WindowDescriptor {
+            id: w.id,
+            title: w.title.clone(),
+            process: w.process.clone(),
+            class: w.class.clone(),
+            width: w.width,
+            x: w.x,
+            focused: Some(w.id) == state.focused_window_id,
+            monitor: w.monitor.clone(),
+            tiled: w.tiled,
+            minimized: w.minimized,
+            desktop_id: w.desktop_id,
+        })
+        .collect();
+    let monitors = state
+        .monitors
+        .iter()
+        .map(|m| types::MonitorDescriptor {
+            index: m.index,
+            device_name: m.device_name.clone(),
+            is_primary: m.is_primary,
+            is_tiling: m.is_tiling,
+            work_area: types::WorkArea {
+                x: m.work_area_x,
+                y: m.work_area_y,
+                width: m.work_area_width,
+                height: m.work_area_height,
+            },
+        })
+        .collect();
+    types::StateResponse {
+        mode: state.mode.clone(),
+        overview_active: state.mode == "overview",
+        windows,
+        focused_id: state.focused_window_id,
+        scroll_offset: state.scroll_offset,
+        total_width: state.total_width,
+        screen_width: state.screen_width,
+        screen_height: state.screen_height,
+        tiling_monitor: state.tiling_monitor_device_name.clone(),
+        monitors,
+    }
 }
 
 pub fn current_state() -> RwLockReadGuard<'static, ApiState> {

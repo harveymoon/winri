@@ -1,17 +1,15 @@
 //! tiny_http worker thread that turns HTTP requests into either snapshot
 //! reads or commands sent to the main loop.
 
-use std::{io::Cursor, sync::Arc, thread};
+use std::{io::Cursor, io::Write as _, sync::Arc, thread, time::Duration};
 
 use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::{
     api::{
-        ApiCommand, NamedAction, ScrollRequest, capture, current_state, send_message,
-        types::{
-            ErrorBody, MonitorDescriptor, MoveToMonitorRequest, ResizeRequest, StateResponse,
-            WindowDescriptor, WorkArea,
-        },
+        ApiCommand, NamedAction, ScrollRequest, build_state_response, capture, current_state,
+        events, send_message,
+        types::{ErrorBody, MoveToMonitorRequest, ResizeRequest},
     },
     app::Message,
     config,
@@ -70,6 +68,7 @@ fn handle_request(request: Request) -> anyhow::Result<()> {
         (Method::Get, "/state") => respond_state(request),
         (Method::Get, "/windows") => respond_windows(request),
         (Method::Get, "/monitors") => respond_monitors(request),
+        (Method::Get, "/events") => handle_events(request),
         (Method::Post, path) if path.starts_with("/windows/")
             && path.ends_with("/move-to-monitor") =>
         {
@@ -145,70 +144,90 @@ fn content_type(value: &'static str) -> Header {
     Header::from_bytes(&b"Content-Type"[..], value.as_bytes()).expect("static header")
 }
 
-fn window_descriptors(state: &crate::api::ApiState) -> Vec<WindowDescriptor> {
-    state
-        .windows
-        .iter()
-        .map(|w| WindowDescriptor {
-            id: w.id,
-            title: w.title.clone(),
-            process: w.process.clone(),
-            class: w.class.clone(),
-            width: w.width,
-            x: w.x,
-            focused: Some(w.id) == state.focused_window_id,
-            monitor: w.monitor.clone(),
-            tiled: w.tiled,
-            minimized: w.minimized,
-            desktop_id: w.desktop_id,
-        })
-        .collect()
-}
-
-fn monitor_descriptors(state: &crate::api::ApiState) -> Vec<MonitorDescriptor> {
-    state
-        .monitors
-        .iter()
-        .map(|m| MonitorDescriptor {
-            index: m.index,
-            device_name: m.device_name.clone(),
-            is_primary: m.is_primary,
-            is_tiling: m.is_tiling,
-            work_area: WorkArea {
-                x: m.work_area_x,
-                y: m.work_area_y,
-                width: m.work_area_width,
-                height: m.work_area_height,
-            },
-        })
-        .collect()
-}
-
 fn respond_state(request: Request) -> anyhow::Result<()> {
     let state = current_state();
-    let response = StateResponse {
-        mode: state.mode.clone(),
-        overview_active: state.mode == "overview",
-        windows: window_descriptors(&state),
-        focused_id: state.focused_window_id,
-        scroll_offset: state.scroll_offset,
-        total_width: state.total_width,
-        screen_width: state.screen_width,
-        screen_height: state.screen_height,
-        tiling_monitor: state.tiling_monitor_device_name.clone(),
-        monitors: monitor_descriptors(&state),
-    };
+    let response = build_state_response(&state);
     respond_json(request, 200, &response)
 }
 
 fn respond_windows(request: Request) -> anyhow::Result<()> {
     let state = current_state();
-    respond_json(request, 200, &window_descriptors(&state))
+    let response = build_state_response(&state);
+    respond_json(request, 200, &response.windows)
 }
 
 fn respond_monitors(request: Request) -> anyhow::Result<()> {
     let state = current_state();
-    respond_json(request, 200, &monitor_descriptors(&state))
+    let response = build_state_response(&state);
+    respond_json(request, 200, &response.monitors)
+}
+
+/// SSE handler — hands the raw TCP writer to a dedicated thread that
+/// writes HTTP headers + an initial state snapshot, then forwards every
+/// subsequent event from the subscriber channel as a `data: <json>\n\n`
+/// line. Returns immediately so the main request loop can keep accepting
+/// new connections.
+fn handle_events(request: Request) -> anyhow::Result<()> {
+    thread::Builder::new()
+        .name("winri-api-sse".into())
+        .spawn(move || {
+            if let Err(e) = run_sse_connection(request) {
+                log::debug!("SSE connection closed: {e:#}");
+            }
+        })?;
+    Ok(())
+}
+
+fn run_sse_connection(request: Request) -> anyhow::Result<()> {
+    let receiver = events::subscribe();
+    let mut writer = request.into_writer();
+
+    // Manually write the HTTP response head — `tiny_http`'s normal path
+    // would set Content-Length, which is wrong for an open-ended stream.
+    let head = b"HTTP/1.1 200 OK\r\n\
+                 Content-Type: text/event-stream\r\n\
+                 Cache-Control: no-cache, no-transform\r\n\
+                 Connection: keep-alive\r\n\
+                 Access-Control-Allow-Origin: *\r\n\
+                 X-Accel-Buffering: no\r\n\
+                 \r\n";
+    writer.write_all(head)?;
+    writer.flush()?;
+
+    // Send the current state immediately so subscribers don't have to
+    // wait for the next tiler tick to populate their UI.
+    {
+        let state = current_state();
+        let response = build_state_response(&state);
+        drop(state);
+        if let Ok(json) = serde_json::to_string(&response) {
+            write_sse_event(&mut writer, &json)?;
+        }
+    }
+
+    // Drain the per-subscriber channel until the client disconnects (a
+    // write to the now-dead socket errors and we exit). A periodic
+    // comment frame (":\n\n") doubles as a keepalive — many HTTP
+    // intermediaries drop idle connections after ~60s, and a comment
+    // doesn't trigger a client-side message handler.
+    loop {
+        match receiver.recv_timeout(Duration::from_secs(20)) {
+            Ok(json) => write_sse_event(&mut writer, &json)?,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                writer.write_all(b":keepalive\n\n")?;
+                writer.flush()?;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    Ok(())
+}
+
+fn write_sse_event(writer: &mut dyn std::io::Write, json: &str) -> std::io::Result<()> {
+    writer.write_all(b"data: ")?;
+    writer.write_all(json.as_bytes())?;
+    writer.write_all(b"\n\n")?;
+    writer.flush()
 }
 
 fn handle_move_to_monitor(mut request: Request, id_str: &str) -> anyhow::Result<()> {

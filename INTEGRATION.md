@@ -93,6 +93,60 @@ rare windows the OS doesn't track in any virtual desktop, so a `.get(...)`
 or `if 'desktop_id' in w` check distinguishes "untracked" from "tracked as
 desktop 0".
 
+### `GET /events`
+
+**Live push channel** — Server-Sent Events stream that emits a fresh
+`/state` payload every time the tiler's state actually changes. Replaces
+polling for any UI that needs to feel real-time (scrub bars, dashboards,
+focus indicators, etc.).
+
+```sh
+curl -N http://127.0.0.1:47812/events
+```
+
+On connect:
+- Standard SSE headers (`Content-Type: text/event-stream`, CORS open).
+- The current state is emitted **immediately** as the first event — no
+  need to also call `/state` to seed your UI.
+- A `:keepalive\n\n` comment frame is sent every 20s so intermediaries
+  don't drop the connection.
+
+Then, **whenever the public `/state` JSON would change**, the same JSON
+is pushed as one `data: <json>\n\n` event. Triggers fan in through one
+internal chokepoint, so you transparently get events for: focus shifts,
+scroll changes, window add/remove, resize completion, virtual desktop
+transitions, monitor topology changes, mode flips (tiler ↔ overview),
+etc. — no per-field event taxonomy to subscribe to.
+
+**Diff-suppression**: byte-identical payloads are dropped, so the 60Hz
+animation tick loop only produces events on the *changing* frames. Mid-
+animation you'll see one event per visibly different state, not 60.
+
+**Reconnect**: if the TCP socket dies, just reconnect — the next event
+will be a full state snapshot. No replay or resume needed.
+
+EventSource example:
+
+```js
+const es = new EventSource("http://127.0.0.1:47812/events");
+es.onmessage = (m) => {
+  const state = JSON.parse(m.data);
+  // ...update UI...
+};
+es.onerror = () => { /* will auto-reconnect */ };
+```
+
+Python (requests + iter_lines):
+
+```python
+import requests, json
+with requests.get("http://127.0.0.1:47812/events", stream=True) as r:
+    for line in r.iter_lines(decode_unicode=True):
+        if line.startswith("data: "):
+            state = json.loads(line[6:])
+            # ...
+```
+
 ### `GET /windows`
 
 Shortcut for just the `windows` array from `/state`.

@@ -27,7 +27,7 @@ use iced::futures::channel::mpsc::Sender;
 
 use crate::app::Message;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ApiState {
     /// Current winri mode — `"tiler"`, `"overview"`, or `"exit"` (the last
     /// is transient and you'll basically never observe it).
@@ -45,7 +45,7 @@ pub struct ApiState {
     pub monitors: Vec<MonitorSnapshot>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MonitorSnapshot {
     pub index: usize,
     pub device_name: String,
@@ -57,7 +57,7 @@ pub struct MonitorSnapshot {
     pub work_area_height: i32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WindowSnapshot {
     /// Raw Win32 HWND, used as the API's stable per-session window id.
     pub id: u64,
@@ -92,17 +92,29 @@ fn state_slot() -> &'static RwLock<ApiState> {
 
 /// Update the snapshot read by API consumers. Called by the main thread
 /// whenever the tiler state changes. Also fans out a serialized snapshot
-/// to any open SSE subscribers — `events::publish` itself diff-suppresses
-/// byte-identical payloads, so animation-tick spam at 60Hz doesn't reach
-/// clients.
+/// to any open SSE subscribers.
+///
+/// Performance gate: a deep `PartialEq` against the previous snapshot
+/// short-circuits the whole pipeline (response build, JSON serialize,
+/// SSE fan-out) when nothing changed. Animation tick at 60Hz produces
+/// many publish_state calls per second that interpolate `scroll_offset`
+/// by tiny amounts; the inner equality check is O(window count) string
+/// compare and avoids the ~10× allocations + serde_json pass that the
+/// downstream path would otherwise do every frame.
 pub fn publish_state(state: ApiState) {
-    // Build the public StateResponse before we drop ownership of `state`
-    // — both /state's request handler and the SSE channel emit this
-    // exact JSON.
-    let response = build_state_response(&state);
-    *state_slot()
-        .write()
-        .expect("api state rwlock poisoned") = state;
+    let response = {
+        let mut current = state_slot()
+            .write()
+            .expect("api state rwlock poisoned");
+        if *current == state {
+            return;
+        }
+        // Build the public response before moving `state` into `current`
+        // so we don't have to read it back out under the write lock.
+        let response = build_state_response(&state);
+        *current = state;
+        response
+    };
     if let Ok(json) = serde_json::to_string(&response) {
         events::publish(json);
     }

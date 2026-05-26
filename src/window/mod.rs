@@ -119,21 +119,25 @@ pub fn batch_move_windows(moves: &[BatchMove]) -> anyhow::Result<()> {
         } {
             Ok(updated) => hdwp = updated,
             Err(e) => {
-                // Diagnostic detail: which exact HWND/rect/flag combination
-                // the OS rejected. Until we see this in the wild we can't
-                // narrow E_INVALIDARG (0x80070057) to a specific cause.
-                log::warn!(
-                    "DeferWindowPos rejected hwnd={:?} pos=({}, {}) size=({}, {}) flags=0x{:08x} batch_idx={}/{} batch_size={} err={} — committing prior moves, falling back per-window",
-                    mv.hwnd,
-                    mv.x,
-                    mv.y,
-                    mv.width,
-                    mv.height,
-                    flags.0,
-                    i,
-                    validated.len().saturating_sub(1),
-                    validated.len(),
-                    e,
+                // `DeferWindowPos` rejects batch_idx=0 100% of the time
+                // on this codebase (root cause never identified; the
+                // per-window fallback succeeds, so user behaviour is
+                // unaffected). The full per-call diagnostic is at TRACE
+                // for future investigation; the first occurrence per
+                // process lifetime gets one INFO line so log readers see
+                // it once without 1500+ identical WARNs.
+                static FIRST_REPORTED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !FIRST_REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    log::info!(
+                        "DeferWindowPos rejected batch_idx=0 (hwnd={:?} pos=({}, {}) size=({}, {}) flags=0x{:08x} batch_size={} err={}); per-window fallback active for this and all subsequent batches",
+                        mv.hwnd, mv.x, mv.y, mv.width, mv.height, flags.0, validated.len(), e,
+                    );
+                }
+                log::trace!(
+                    "DeferWindowPos rejected hwnd={:?} pos=({}, {}) size=({}, {}) flags=0x{:08x} batch_idx={}/{} err={}",
+                    mv.hwnd, mv.x, mv.y, mv.width, mv.height, flags.0, i,
+                    validated.len().saturating_sub(1), e,
                 );
                 failed_at = Some(i);
                 break;

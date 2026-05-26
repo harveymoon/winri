@@ -79,7 +79,16 @@ impl app::State {
             self.pending_initial_consolidation = false;
         }
 
-        log::info!("Snapshot: {:?}", get_process_names(&windows_snapshot));
+        // This per-snapshot dump used to log at INFO and was the largest
+        // single contributor to log volume (128 MB / 32 hrs in one
+        // observed session). It also called `process_name` / `class` /
+        // `title` per window just to build the string — those queries
+        // are duplicated in `should_be_tiled`, `publish_api_snapshot`,
+        // etc. Now gated on `log::log_enabled!(Debug)` so the Win32
+        // syscalls are skipped entirely at the default log level.
+        if log::log_enabled!(log::Level::Debug) {
+            log::debug!("Snapshot: {:?}", get_process_names(&windows_snapshot));
+        }
 
         if initial_pass {
             // Force-add every window in the snapshot regardless of monitor.

@@ -419,10 +419,28 @@ impl State {
     pub fn handle_app_message(&mut self, message: Message) -> Task<Message> {
         let mut task = Task::none();
 
-        // HACK: By default the overlay window steals focus when created, but should not be able to be focused.
-        // It causes weird behavior like keystroke not recorded until another window is focused.
-        // So we refocus the desktop window after creation.
-        task = task.chain(task::ensure_overlay_not_focused(self.overlay_window_id));
+        // HACK: the overlay window steals focus when iced creates / shows it,
+        // and we want desktop focus restored after that. Used to run
+        // unconditionally on every message — at 60Hz animation ticks plus
+        // every snapshot publish, that was ~120 GetForegroundWindow +
+        // GetDesktopWindow syscalls/sec for a no-op in almost every case.
+        // Now gated on the messages that could plausibly steal focus:
+        // anything else (AnimationTick, cursor tracking, SSE-driven API
+        // commands, etc.) can't change focus state, so the check is wasted.
+        let could_steal_focus = matches!(
+            message,
+            Message::Overview(_)
+                | Message::Action(_)
+                | Message::Settings(_)
+                | Message::Global(_)
+                | Message::WindowMouseDown(_)
+                | Message::WindowMouseUp(_)
+                | Message::WindowMouseRightDown(_)
+                | Message::WindowClosed(_)
+        );
+        if could_steal_focus {
+            task = task.chain(task::ensure_overlay_not_focused(self.overlay_window_id));
+        }
 
         match message {
             Message::Global(global_message) => {

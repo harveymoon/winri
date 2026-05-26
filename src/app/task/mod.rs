@@ -1,7 +1,6 @@
 /// This module contains asynchronous `task`s for the iced runtime.
 use anyhow::Context;
 use iced::Task;
-use joy_error::{ResultUtilityExt, log::ResultLogExt};
 
 use crate::{
     app::{self},
@@ -11,11 +10,14 @@ use crate::{
 
 pub fn ensure_overlay_not_focused(overlay_window_id: iced::window::Id) -> Task<app::Message> {
     iced::window::raw_id::<app::Message>(overlay_window_id).then(|raw_id| {
-        unfocus_window(raw_id)
-            .context("unfocusing overlay window")
-            .error()
-            .log_err()
-            .discard();
+        // Failure here is benign and recurring (transient
+        // GetForegroundWindow nulls during focus transitions). The old
+        // .error().log_err() path emitted ERROR-level lines on every
+        // miss — ~100 per session for a fundamentally OK condition,
+        // crowding out actual errors. Log at debug.
+        if let Err(e) = unfocus_window(raw_id) {
+            log::debug!("ensure_overlay_not_focused: {e:#}");
+        }
         Task::none()
     })
 }

@@ -151,6 +151,14 @@ impl app::State {
                 .unwrap_or_default()
         };
 
+        // Snapshot-scoped foreground HWND — capture once, compare against
+        // each window's id below. `Window::is_focused()` per window meant
+        // GetForegroundWindow ran N+M times per snapshot (one per tiled
+        // and floating window); this collapses it to one call total.
+        let foreground_hwnd: Option<u64> = crate::window::Window::focused()
+            .ok()
+            .map(|w| w.handle().0 as u64);
+
         let mut windows = Vec::new();
         let mut current_x = self.tiler.padding();
         let mut focused_window_id: Option<u64> = None;
@@ -159,8 +167,7 @@ impl app::State {
             let title = item.inner.title().ok().flatten().unwrap_or_default();
             let process = item.inner.process_name().unwrap_or_default();
             let class = item.inner.class().unwrap_or_default();
-            let focused = item.inner.is_focused().unwrap_or(false);
-            if focused {
+            if Some(hwnd_raw) == foreground_hwnd {
                 focused_window_id = Some(hwnd_raw);
             }
             windows.push(crate::api::WindowSnapshot {

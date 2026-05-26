@@ -34,7 +34,9 @@
 
 use std::{
     cell::RefCell,
+    collections::HashMap,
     sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 
 use windows::Win32::{
@@ -48,7 +50,19 @@ thread_local! {
     /// Outer `Option`: "have we tried to create the manager yet?".
     /// Inner `Option`: "did the creation succeed?".
     static MANAGER: RefCell<Option<Option<IVirtualDesktopManager>>> = const { RefCell::new(None) };
+    /// Per-HWND cache of `GetWindowDesktopId` results to skip the
+    /// COM-marshalled round-trip to dwm.exe on hot snapshot paths.
+    /// Entries are valid for [`HWND_GUID_TTL`].
+    static HWND_GUID_CACHE: RefCell<HashMap<u64, (GUID, Instant)>> =
+        RefCell::new(HashMap::new());
 }
+
+/// How long a cached `GetWindowDesktopId` result is trusted. Chosen to
+/// stay below the typical snapshot interval (~200ms) so almost every
+/// publish hits cache, while still picking up a real desktop change
+/// within a beat. A window genuinely moves between desktops only on
+/// explicit user action (Task View drag etc.).
+const HWND_GUID_TTL: Duration = Duration::from_millis(800);
 
 fn with_manager<F, R>(f: F) -> Option<R>
 where
@@ -81,9 +95,32 @@ fn registry() -> &'static Mutex<Vec<GUID>> {
 /// Returns `None` when the OS doesn't have the window in any virtual
 /// desktop (some shell / system windows). Indexing is by first-sighting
 /// within the session — see the module docs.
+///
+/// Performance: result is cached per HWND with [`HWND_GUID_TTL`].
+/// `GetWindowDesktopId` is a cross-apartment COM call into dwm.exe;
+/// caching collapses ~14 calls/snapshot to ~14 calls/second.
 pub fn desktop_id_for(hwnd_raw: u64) -> Option<u32> {
-    let hwnd = HWND(hwnd_raw as *mut std::ffi::c_void);
-    let guid = with_manager(|mgr| unsafe { mgr.GetWindowDesktopId(hwnd) }.ok())?;
+    let now = Instant::now();
+
+    let cached = HWND_GUID_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .get(&hwnd_raw)
+            .filter(|(_, ts)| now.duration_since(*ts) < HWND_GUID_TTL)
+            .map(|(g, _)| *g)
+    });
+
+    let guid = match cached {
+        Some(g) => g,
+        None => {
+            let hwnd = HWND(hwnd_raw as *mut std::ffi::c_void);
+            let fresh = with_manager(|mgr| unsafe { mgr.GetWindowDesktopId(hwnd) }.ok())?;
+            HWND_GUID_CACHE.with(|cache| {
+                cache.borrow_mut().insert(hwnd_raw, (fresh, now));
+            });
+            fresh
+        }
+    };
 
     if guid == GUID::zeroed() {
         return None;

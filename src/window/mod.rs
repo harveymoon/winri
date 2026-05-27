@@ -15,11 +15,12 @@ use windows::{
             Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ},
         },
         UI::WindowsAndMessaging::{
-            EnumWindows, GA_ROOT, GWL_STYLE, GetAncestor, GetClassNameW, GetClientRect,
-            GetWindowLongW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-            GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, MoveWindow,
-            PostMessageW, SW_RESTORE, SWP_NOSIZE, SetForegroundWindow, SetWindowPos,
-            ShowWindow, WINDOW_LONG_PTR_INDEX, WINDOW_STYLE, WM_CLOSE, WS_DLGFRAME, WS_POPUP,
+            EnumWindows, GA_ROOT, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetAncestor, GetClassNameW,
+            GetClientRect, GetWindow, GetWindowLongW, GetWindowRect, GetWindowTextLengthW,
+            GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
+            MoveWindow, PostMessageW, SW_RESTORE, SWP_NOSIZE, SetForegroundWindow, SetWindowPos,
+            ShowWindow, WINDOW_LONG_PTR_INDEX, WINDOW_STYLE, WM_CLOSE, WS_DLGFRAME, WS_EX_TOOLWINDOW,
+            WS_POPUP,
         },
     },
     core::BOOL,
@@ -295,6 +296,35 @@ impl Window {
         let style = WINDOW_STYLE(style as u32);
 
         Ok(style.contains(WS_POPUP) && style.contains(WS_DLGFRAME))
+    }
+
+    /// `true` if the window has the `WS_EX_TOOLWINDOW` extended style.
+    /// Apps set this on floating palettes, tool windows, devtools,
+    /// color pickers, etc. — windows that intentionally don't appear in
+    /// Alt-Tab or the taskbar. Electron uses it heavily for popup
+    /// children of a main BrowserWindow. We should not tile these:
+    /// they're auxiliaries that belong with their owner.
+    pub fn is_tool_window(self) -> anyhow::Result<bool> {
+        ensure_valid!(self);
+        let exstyle = self.get_window_long(GWL_EXSTYLE)?;
+        #[allow(clippy::cast_sign_loss, reason = "WINDOW_EX_STYLE is u32")]
+        let exstyle = exstyle as u32;
+        Ok(exstyle & WS_EX_TOOLWINDOW.0 != 0)
+    }
+
+    /// `true` if the window has an owner window (per Win32 ownership,
+    /// not parent-child). `GetWindow(hwnd, GW_OWNER)` returns the
+    /// owning HWND for popups/dialogs that were created with an owner
+    /// in `CreateWindowEx`; main app windows have no owner and return
+    /// NULL. Filtering on this catches popup BrowserWindows, modal
+    /// dialogs, color pickers, autocomplete dropdowns, etc. that
+    /// belong to a parent we're already tiling.
+    pub fn has_owner(self) -> anyhow::Result<bool> {
+        ensure_valid!(self);
+        // GetWindow doesn't set last-error on "no owner" — it just
+        // returns NULL. Don't wrap in wincall_result.
+        let owner = unsafe { GetWindow(self.handle(), GW_OWNER) };
+        Ok(owner.as_ref().is_ok_and(|h| !h.is_invalid()))
     }
 
     pub fn title(self) -> anyhow::Result<Option<String>> {

@@ -48,6 +48,17 @@ pub fn should_be_tiled(window: Window) -> anyhow::Result<bool> {
     filter_out_if!(window.is_cloaked()?);
     filter_out_if!(!window.is_ancestor()?);
     filter_out_if!(window.is_dialog()?);
+    // Tool windows (WS_EX_TOOLWINDOW) — floating palettes, devtools,
+    // color pickers. Apps explicitly mark these "not a main window";
+    // they don't appear in Alt-Tab or the taskbar. Electron uses it
+    // for many BrowserWindow popups. We treat them the same.
+    filter_out_if!(window.is_tool_window()?);
+    // Owned windows (GW_OWNER non-null) — popups, dialogs, dropdowns,
+    // autocomplete suggestions. Their owner is a window we already
+    // manage; an owned popup logically belongs *with* that owner and
+    // dragging it into the tile strip on its own splits a single
+    // logical app across two slots.
+    filter_out_if!(window.has_owner()?);
     let title = window.title()?;
     filter_out_if!(title.is_none());
     filter_out_if!(title.is_some_and(|title| title.contains(WINRI_IGNORED_WINDOW_TITLE_SUBSTRING)));

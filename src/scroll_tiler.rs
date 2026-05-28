@@ -1247,6 +1247,30 @@ impl ScrollTiler {
 
     /// Width
     fn update_widths(&mut self) {
+        /// Max width delta from cached `window.width` that we trust
+        /// from `desktop_manager_bounds` while the mouse isn't held.
+        /// Above this, assume the OS silently rejected our last
+        /// SetWindowPos (Chromium i16 clamp, app-side
+        /// WM_GETMINMAXINFO, modal apps with strict size constraints)
+        /// and the bounds value is the stale pre-resize / app-natural
+        /// width. Without this clamp, those rejections silently
+        /// rewrite our tile width to whatever the app preferred,
+        /// producing the "huge active width on desktop 2" effect:
+        /// freshly-tiled apps stomp default_size with their natural
+        /// 1500–2000 px size on the very first snapshot.
+        ///
+        /// 250px is generous enough to admit a fast legitimate
+        /// drag-resize (~500 px/s × ~200 ms snapshot = ~100 px) while
+        /// catching the typical "Chrome stayed at 1900, we wanted 1270"
+        /// case.
+        const MAX_UNTRUSTED_DELTA: f32 = 250.0;
+
+        // When the mouse is held, the user is most likely actively
+        // resizing — large per-tick deltas are expected and should be
+        // trusted. The clamp only kicks in at rest, where bounds-vs-
+        // cache disagreement implies an unobserved rejection.
+        let mouse_held = is_left_mouse_held();
+
         let max_screen_width = self.max_screen_width();
         for window in &mut self.windows {
             if let Some(requested_width) = window.requested_width() {
@@ -1263,7 +1287,15 @@ impl ScrollTiler {
                 .error()
                 .log_err()
             {
-                window.width = bounds.size().width().min(max_screen_width);
+                let new_w = bounds.size().width().min(max_screen_width);
+                if !mouse_held && (new_w - window.width).abs() > MAX_UNTRUSTED_DELTA {
+                    // Suspect bounds — keep cached intent. The next
+                    // layout pass will re-issue SetWindowPos with our
+                    // width; whether it sticks or not, we won't have
+                    // overwritten our intent in the meantime.
+                    continue;
+                }
+                window.width = new_w;
             }
         }
     }

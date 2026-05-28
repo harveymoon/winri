@@ -14,15 +14,22 @@ If winri prevents you from doing what you want in any way, open an issue to disc
 
 > Status: Early prototype. Expect breaking changes until 1.0.0
 
+> This is the `harveymoon/winri` fork. Releases live at https://github.com/harveymoon/winri/releases. Upstream is [`sub07/winri`](https://github.com/sub07/winri); this fork accumulates fixes and features not yet upstreamed (see "Fork changes" below).
+
 ![winri-demo](https://github.com/user-attachments/assets/db90ad36-6ed0-4278-acad-ec3d833b5fe9)
 
 ## Features
 
 - Horizontal scroll tiler with dynamic window widths
-- Keyboard-centric navigation.
+- Keyboard-centric navigation
 - One‑key fullscreen / half‑screen sizing
-- Overview mode with live thumbnails
-- Safe recovery: windows moved to visible viewport when exiting or on panic
+- Overview mode with live thumbnails + right-click menu (close / force-redraw)
+- Multi-monitor: dedicated tiling monitor, drag-out to float on other monitors, secondary-monitor overflow clipping
+- System tray icon + per-app exemptions
+- Local HTTP / Server-Sent-Events control API for Stream Deck, AHK, web dashboards (see `INTEGRATION.md`)
+- Smooth animated scroll and resize (API-driven and keyboard)
+- Settings modal (Win+,) with side-tabs
+- Safe recovery: windows moved to visible viewport, clips cleared on exit, panic, and at startup
 
 ## Installation
 
@@ -144,9 +151,10 @@ Nonetheless, keep in mind that manipulating windows of other applications can ha
 
 ## Known Limitations
 
-- Single-monitor assumptions for now (multi-monitor works but not supported / tested)
-- Hard-coded keybindings for now
+- Hard-coded keybindings (configurable from settings is partial; full rebinding is still TODO)
 - Some applications may not behave correctly (e.g. some UWP like windows calculator or settings)
+- A clipped window whose geometric center crosses onto a second monitor will briefly flicker at the new monitor's DPI as it scrolls past the boundary (Windows reassigns per-monitor DPI by window center; cannot be suppressed without moving the window)
+- Apps that quietly clamp coordinates to `i16::MAX` (Chromium-based, including Chrome and Electron) need the tile strip kept inside `±25_000` px — handled internally, but extremely wide strips may not behave well
 
 See issue tracker for more.
 
@@ -159,7 +167,24 @@ A: Winri works with standard Win32 GUI applications. Some applications like UWP 
 A: Not yet, but this feature is planned for future releases.
 
 **Q: Is there multi-monitor support?**
-A: Not yet, but it is on the roadmap.
+A: Yes. Pick one monitor as the tiling monitor; other monitors hold floating windows. Drag a tile onto a secondary monitor to untile it; drag a window back onto the tiling monitor to tile it. Tiles that scroll past the tiling monitor's edge are clipped, not spilled.
+
+## Fork changes (since upstream `v0.3.2`)
+
+Bugs, perf work, and features that landed on this fork's `dev`:
+
+- **Multi-monitor**: configurable tiling monitor, drag-out / drag-back to (un)tile, secondary-monitor overflow hidden via `SetWindowRgn` clip (with full clip-restore on crash + clean exit)
+- **Virtual desktop survival**: cloaked + iconic windows no longer get pruned; window-strip respects desktop changes
+- **Chrome / Chromium / Electron compat**: park coordinates kept inside `i16::MAX`, defensive divergence detection, Electron `WS_EX_TOOLWINDOW` + owned-popup filtering, `/wake` recovery endpoint for blank windows
+- **Win11 Widgets**: `WidgetBoard.exe` and friends filtered so the panel doesn't ghost-tile as "MSN"
+- **Window-hook crash fix**: `EVENT_OBJECT_LOCATIONCHANGE` handling moved off per-event thread spawns onto a single persistent coalescer (was hitting `ERROR_COMMITMENT_LIMIT` after long sessions)
+- **Process-handle leak fix**: `OpenProcess` is now `CloseHandle`'d via RAII (was accumulating ~300k+ handles per session)
+- **Performance**: per-snapshot Win32 dedup, virtual-desktop GUID cache, snapshot info-log gated to debug, `publish_state` short-circuits on no-diff
+- **Overview**: right-click context menu (close, force-redraw); jump-to-thumbnail focus reliability
+- **Settings**: modal popup with side-tabs (General / Apps / Excludes), Win+, re-open after X-close
+- **Control API** (`INTEGRATION.md`): `/state`, `/windows`, `/scroll` (now with `animate_ms`), `/windows/{id}/resize` (with `animate_ms` + `center`), `/windows/{id}/wake`, `GET /events` SSE push channel
+- **Animated drag-resize**: dragging a tile's left edge animates the scroll instead of jumping the right edge
+- **Width-cache trust**: `update_widths` rejects large bounds-vs-cache deltas at rest (Chrome / Electron / TouchDesigner no longer get stomped to natural width on first snapshot)
 
 ## Disclaimer
 

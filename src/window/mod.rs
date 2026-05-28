@@ -61,39 +61,25 @@ pub struct BatchMove {
     pub height: i32,
 }
 
-/// Move many windows via `BeginDeferWindowPos` / `EndDeferWindowPos`.
+/// Move many windows in one pass. Historically this tried
+/// `BeginDeferWindowPos`/`DeferWindowPos`/`EndDeferWindowPos` for a
+/// single DWM composition frame, but the very first deferred call
+/// failed with `E_INVALIDARG` on **every** batch in this codebase
+/// (root cause never identified across multiple sessions of
+/// investigation — the deferred path was 100% dead). The per-window
+/// `SetWindowPos` fallback was already doing 100% of the actual work,
+/// so the batched scaffolding was paying for itself with nothing.
 ///
-/// Two layers of defense against the all-or-nothing failure mode that
-/// stranded windows offscreen in earlier builds:
-///
-/// 1. **Pre-validate**: every HWND is `IsWindow`-checked before being
-///    added to the batch. Stale handles from windows that closed between
-///    enumeration and the move are dropped silently.
-///
-/// 2. **Best-effort fallback per move**: if `DeferWindowPos` errors on a
-///    particular move, the HDWP becomes invalid. We commit what was
-///    already queued (so the prior valid moves DO apply), then issue
-///    per-window `SetWindowPos` calls for the remainder with the same
-///    flags. One bad window can no longer drag every other window down
-///    with it.
-///
-/// Flags applied: `SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOSENDCHANGING |
-/// SWP_DEFERERASE | SWP_ASYNCWINDOWPOS` so a hung target app can't block
-/// the move and we skip the `WM_WINDOWPOSCHANGING` round-trip.
+/// Now: pre-validate HWNDs (skip stale ones — they close between
+/// enumeration and the move), then issue one async `SetWindowPos` per
+/// window. Same flag set as before:
+/// `SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOSENDCHANGING | SWP_DEFERERASE
+/// | SWP_ASYNCWINDOWPOS` — a hung target app can't block the loop.
 pub fn batch_move_windows(moves: &[BatchMove]) -> anyhow::Result<()> {
     use windows::Win32::UI::WindowsAndMessaging::{
-        BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, HDWP, IsWindow, SetWindowPos,
-        SWP_ASYNCWINDOWPOS, SWP_DEFERERASE, SWP_NOACTIVATE, SWP_NOSENDCHANGING, SWP_NOZORDER,
+        IsWindow, SetWindowPos, SWP_ASYNCWINDOWPOS, SWP_DEFERERASE, SWP_NOACTIVATE,
+        SWP_NOSENDCHANGING, SWP_NOZORDER,
     };
-
-    // Filter stale HWNDs up front so DeferWindowPos doesn't trip over them.
-    let validated: Vec<&BatchMove> = moves
-        .iter()
-        .filter(|mv| unsafe { IsWindow(Some(mv.hwnd)) }.as_bool())
-        .collect();
-    if validated.is_empty() {
-        return Ok(());
-    }
 
     let flags = SWP_NOACTIVATE
         | SWP_NOZORDER
@@ -101,69 +87,17 @@ pub fn batch_move_windows(moves: &[BatchMove]) -> anyhow::Result<()> {
         | SWP_DEFERERASE
         | SWP_ASYNCWINDOWPOS;
 
-    let mut hdwp: HDWP = unsafe {
-        BeginDeferWindowPos(i32::try_from(validated.len()).unwrap_or(i32::MAX))
-    }
-    .with_context(|| {
-        format!(
-            "BeginDeferWindowPos failed (count={}, flags=0x{:08x})",
-            validated.len(),
-            flags.0
-        )
-    })?;
-
-    // Track where we got to so we can fall back per-window from there.
-    let mut failed_at: Option<usize> = None;
-    for (i, mv) in validated.iter().enumerate() {
-        match unsafe {
-            DeferWindowPos(hdwp, mv.hwnd, None, mv.x, mv.y, mv.width, mv.height, flags)
-        } {
-            Ok(updated) => hdwp = updated,
-            Err(e) => {
-                // `DeferWindowPos` rejects batch_idx=0 100% of the time
-                // on this codebase (root cause never identified; the
-                // per-window fallback succeeds, so user behaviour is
-                // unaffected). The full per-call diagnostic is at TRACE
-                // for future investigation; the first occurrence per
-                // process lifetime gets one INFO line so log readers see
-                // it once without 1500+ identical WARNs.
-                static FIRST_REPORTED: std::sync::atomic::AtomicBool =
-                    std::sync::atomic::AtomicBool::new(false);
-                if !FIRST_REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    log::info!(
-                        "DeferWindowPos rejected batch_idx=0 (hwnd={:?} pos=({}, {}) size=({}, {}) flags=0x{:08x} batch_size={} err={}); per-window fallback active for this and all subsequent batches",
-                        mv.hwnd, mv.x, mv.y, mv.width, mv.height, flags.0, validated.len(), e,
-                    );
-                }
-                log::trace!(
-                    "DeferWindowPos rejected hwnd={:?} pos=({}, {}) size=({}, {}) flags=0x{:08x} batch_idx={}/{} err={}",
-                    mv.hwnd, mv.x, mv.y, mv.width, mv.height, flags.0, i,
-                    validated.len().saturating_sub(1), e,
-                );
-                failed_at = Some(i);
-                break;
-            }
+    for mv in moves {
+        if !unsafe { IsWindow(Some(mv.hwnd)) }.as_bool() {
+            continue;
         }
-    }
-
-    // Commit whatever we successfully queued. If the loop broke we still
-    // pass the HDWP returned by the last successful DeferWindowPos — it
-    // contains the valid earlier moves.
-    let _ = unsafe { EndDeferWindowPos(hdwp) };
-
-    // For the failed move and everything after, fall back to per-window
-    // SetWindowPos. Same flags — a bad window just gets logged and
-    // skipped without affecting the rest.
-    if let Some(start) = failed_at {
-        for mv in &validated[start..] {
-            if let Err(e) = unsafe {
-                SetWindowPos(mv.hwnd, None, mv.x, mv.y, mv.width, mv.height, flags)
-            } {
-                log::warn!(
-                    "Per-window SetWindowPos fallback rejected hwnd={:?} pos=({}, {}) size=({}, {}) flags=0x{:08x} err={}",
-                    mv.hwnd, mv.x, mv.y, mv.width, mv.height, flags.0, e,
-                );
-            }
+        if let Err(e) = unsafe {
+            SetWindowPos(mv.hwnd, None, mv.x, mv.y, mv.width, mv.height, flags)
+        } {
+            log::warn!(
+                "SetWindowPos rejected hwnd={:?} pos=({}, {}) size=({}, {}) flags=0x{:08x} err={}",
+                mv.hwnd, mv.x, mv.y, mv.width, mv.height, flags.0, e,
+            );
         }
     }
 

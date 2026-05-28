@@ -16,7 +16,11 @@ pub struct State {
 macro_rules! bind_tiler_mode_result {
     ($mode:expr => TilerState { $($bindings:tt),+ }) => {
         let Mode::Tiler(State { $($bindings),+ ,.. }) = &mut $mode else {
-            log::warn!(
+            // Routine: background ticks fire continuously while the
+            // user is in overview mode and early-return here. Was WARN
+            // (9 lines per overview open); demoted to debug since it's
+            // expected control flow, not a problem.
+            log::debug!(
                 "Tiler operation requested in {} while not in Tiler mode",
                 crate::function!()
             );

@@ -78,6 +78,16 @@ pub struct WindowItem {
     /// Cached on the item so we don't re-classify the window on every
     /// layout tick.
     skip_clipping: bool,
+    /// `is_iconic()` result captured at the end of the previous snapshot
+    /// tick. Used to detect the minimize/restore transition so we can
+    /// snapshot the tile width before minimize and re-assert it on
+    /// restore. Without this, some apps (Chromium-class especially)
+    /// restore at a sliver-sized rect; we'd cache that and never
+    /// recover the original tile width.
+    was_iconic_last_tick: bool,
+    /// Width the tile had immediately before the window went iconic.
+    /// Cleared as soon as it's been re-applied on restore.
+    pre_minimize_width: Option<f32>,
 }
 
 impl WindowItem {
@@ -92,6 +102,8 @@ impl WindowItem {
             width_animation: None,
             last_observed_pos: None,
             skip_clipping,
+            was_iconic_last_tick: false,
+            pre_minimize_width: None,
         }
     }
 
@@ -682,6 +694,30 @@ impl ScrollTiler {
             item.inner.is_valid().unwrap_or(false)
                 && item.inner.is_cloaked().unwrap_or(false)
         });
+
+        // Iconic transition: snapshot the tile width on entry to iconic,
+        // re-assert it on exit. Restored windows (especially Chromium-
+        // based) often come back at a sliver-sized rect that the next
+        // tick's update_widths could otherwise pick up; pinning
+        // `requested_width` here forces the layout pass to re-issue
+        // SetWindowPos at the original tile width before the user sees
+        // the sliver. `last_layout = None` defeats the diff-skip so the
+        // SetWindowPos actually fires even if the cache says we're
+        // already there.
+        for item in &mut self.windows {
+            let now_iconic = item.inner.is_iconic();
+            if !item.was_iconic_last_tick && now_iconic {
+                // Just minimized — capture intent.
+                item.pre_minimize_width = Some(item.width);
+            } else if item.was_iconic_last_tick && !now_iconic {
+                // Just restored — re-apply intent.
+                if let Some(w) = item.pre_minimize_width.take() {
+                    item.requested_width = Some(w);
+                    item.last_layout = None;
+                }
+            }
+            item.was_iconic_last_tick = now_iconic;
+        }
 
         // Drag-end detection. If the user was holding left mouse last
         // snapshot and isn't now, they just released. A tiled window
@@ -1301,6 +1337,12 @@ impl ScrollTiler {
                 // Cloaked = on another virtual desktop. desktop_manager_bounds
                 // for these can return stale/zeroed data; preserve the
                 // last-known visible width so it's correct when un-cloaked.
+                continue;
+            } else if window.inner.is_iconic() {
+                // Iconic windows return the icon-strip rect (~200 px) from
+                // desktop_manager_bounds — never trust that as the tile
+                // width. The pre-minimize snapshot in handle_window_snapshot
+                // re-asserts the real intent on restore.
                 continue;
             } else if let Ok(bounds) = window
                 .inner

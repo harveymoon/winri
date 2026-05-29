@@ -246,6 +246,22 @@ impl Window {
         Ok(exstyle & WS_EX_TOOLWINDOW.0 != 0)
     }
 
+    /// `true` if this window belongs to a Chromium-based process
+    /// (Chrome, Edge, Brave, Opera, every Electron app — anything that
+    /// composes through Chromium's `Chrome_WidgetWin_*` HWND).
+    ///
+    /// We skip `SetWindowRgn` for these: Chromium binds a DirectX swap
+    /// chain to the HWND, and rapid region changes detach the surface.
+    /// Once detached, the window goes "frosted transparent" (DWM
+    /// background visible through where the WebView used to render) and
+    /// only restarting the Chromium process recovers it. The secondary-
+    /// monitor overflow clip is the visible cost; preserved
+    /// compositors are the win.
+    pub fn is_clip_unsafe(self) -> anyhow::Result<bool> {
+        let class = self.class()?;
+        Ok(class.starts_with("Chrome_WidgetWin_"))
+    }
+
     /// `true` if the window has an owner window (per Win32 ownership,
     /// not parent-child). `GetWindow(hwnd, GW_OWNER)` returns the
     /// owning HWND for popups/dialogs that were created with an owner

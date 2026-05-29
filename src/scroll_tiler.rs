@@ -71,10 +71,18 @@ pub struct WindowItem {
     /// loop, so an app that persistently rejects our SetWindowPos can't
     /// keep us calling SetWindowPos every snapshot.
     last_observed_pos: Option<(f32, f32)>,
+    /// Resolved once at construction from `Window::is_clip_unsafe()`.
+    /// When `true`, the clip pass skips `SetWindowRgn` for this window
+    /// entirely (Chromium-based windows lose their swap chain on rapid
+    /// region changes — see `Window::is_clip_unsafe` for the rationale).
+    /// Cached on the item so we don't re-classify the window on every
+    /// layout tick.
+    skip_clipping: bool,
 }
 
 impl WindowItem {
-    pub const fn new(inner: Window, width: f32) -> Self {
+    pub fn new(inner: Window, width: f32) -> Self {
+        let skip_clipping = inner.is_clip_unsafe().unwrap_or(false);
         Self {
             inner,
             requested_width: Some(width),
@@ -83,6 +91,7 @@ impl WindowItem {
             last_clip: None,
             width_animation: None,
             last_observed_pos: None,
+            skip_clipping,
         }
     }
 
@@ -1214,6 +1223,19 @@ impl ScrollTiler {
         } else {
             for d in &decisions {
                 let item = &mut self.windows[d.idx];
+                // Chromium-class windows: never apply (or re-apply) a
+                // clip. If a previous winri version (or this session,
+                // before the window was classified) left one on, scrub
+                // it once and move on. See `Window::is_clip_unsafe`.
+                if item.skip_clipping {
+                    if item.last_clip.is_some() {
+                        if let Err(e) = item.inner.clear_visible_region() {
+                            warn!("clear_visible_region (chromium scrub) failed: {e}");
+                        }
+                        item.last_clip = None;
+                    }
+                    continue;
+                }
                 if d.fully_offscreen {
                     if item.last_clip.is_some() {
                         if let Err(e) = item.inner.clear_visible_region() {

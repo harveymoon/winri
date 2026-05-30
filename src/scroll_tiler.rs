@@ -246,6 +246,11 @@ pub struct ScrollTiler {
     smooth_scroll_enabled: bool,
     /// Per-tick interpolation factor. Mirrors `tiling.smooth_scroll_factor`.
     smooth_scroll_factor: f32,
+    /// Whether to apply per-process scroll-frame throttling for known-slow
+    /// apps (`SLOW_PROCESS_FRAME_THROTTLE`). Mirrors
+    /// `tiling.throttle_slow_apps`. Off = every window gets SetWindowPos
+    /// every frame regardless of process — the pre-throttle behaviour.
+    throttle_slow_apps: bool,
     /// The size of the screen where the tiler is applied.
     screen_size: Size,
     /// The index of the previously focused window. Used as a fallback when the focused window is not tiled.
@@ -277,6 +282,7 @@ impl ScrollTiler {
             resize_increment,
             screen_size,
             smooth_scroll_factor: 0.25,
+            throttle_slow_apps: true,
             // Seed from the actual key state so a mouse that's already
             // held when winri starts doesn't trigger a spurious drag-end
             // on the very first snapshot.
@@ -289,6 +295,14 @@ impl ScrollTiler {
     pub fn set_smoothing(&mut self, enabled: bool, factor: f32) {
         self.smooth_scroll_enabled = enabled;
         self.smooth_scroll_factor = factor.clamp(0.05, 1.0);
+    }
+
+    /// Enable or disable per-process scroll-frame throttling
+    /// (`SLOW_PROCESS_FRAME_THROTTLE`). When disabled, all windows get
+    /// SetWindowPos every animation frame regardless of process — the
+    /// pre-throttle behaviour.
+    pub fn set_throttle_slow_apps(&mut self, enabled: bool) {
+        self.throttle_slow_apps = enabled;
     }
 
     /// Whether any smoothing animation is currently in progress —
@@ -1331,9 +1345,21 @@ impl ScrollTiler {
             // including the scroll_just_ended frame), emit
             // unconditionally so the window lands at its real
             // resting position.
+            //
+            // **Park transitions always emit** regardless of throttle:
+            // when a window crosses the viewport edge into or out of
+            // the parked-offscreen state, skipping the move leaves it
+            // visually stuck at the edge for the rest of the throttle
+            // cycle (User-reported "Explorer sticks at the edge").
+            let prev_was_parked = item
+                .last_layout
+                .is_some_and(|(px, _, _, _)| (px - PARK_X).abs() < 1.0);
+            let park_transition = prev_was_parked != d.fully_offscreen;
             if animating_now
+                && self.throttle_slow_apps
                 && item.scroll_frame_throttle > 1
                 && self.scroll_frame_index % item.scroll_frame_throttle != 0
+                && !park_transition
             {
                 continue;
             }

@@ -74,6 +74,12 @@ pub struct TilingConfig {
     /// lower = floatier. At 60 fps, 0.2 settles to within 1% in ~22 frames
     /// (~360 ms); 0.4 in ~9 frames (~150 ms).
     pub smooth_scroll_factor: f32,
+    /// Throttle SetWindowPos rate for known-slow apps (currently
+    /// `explorer.exe`) during scroll animations so their UI thread can
+    /// keep up. With this off, Explorer trails the strip visually by
+    /// hundreds-to-thousands of pixels during fast scrolls. Other apps
+    /// are unaffected either way.
+    pub throttle_slow_apps: bool,
 }
 
 impl Default for TilingConfig {
@@ -83,6 +89,7 @@ impl Default for TilingConfig {
             resize_increment: 20.0,
             smooth_scroll: true,
             smooth_scroll_factor: 0.25,
+            throttle_slow_apps: true,
         }
     }
 }
@@ -127,6 +134,9 @@ resize_increment = 20.0
 smooth_scroll = true
 # Snappiness of the smoothing (0.05 = floaty, 1.0 = effectively snap).
 smooth_scroll_factor = 0.25
+# Throttle SetWindowPos rate for known-slow apps (File Explorer) so they
+# stay in sync with the strip during fast scrolls. Other apps unaffected.
+throttle_slow_apps = true
 
 [filter]
 # Extra process executables (.exe filename, case-sensitive) to exempt from

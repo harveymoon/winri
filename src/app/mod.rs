@@ -155,17 +155,19 @@ fn create_settings_window() -> (iced::window::Id, Task<Message>) {
 impl State {
     pub fn new() -> (Self, Task<Message>) {
         let screen_size = system::screen_size().expect("Screen size retrieval");
-        let (padding, resize_increment, smooth_enabled, smooth_factor) = {
+        let (padding, resize_increment, smooth_enabled, smooth_factor, throttle_slow_apps) = {
             let cfg = config::current();
             (
                 cfg.tiling.padding,
                 cfg.tiling.resize_increment,
                 cfg.tiling.smooth_scroll,
                 cfg.tiling.smooth_scroll_factor,
+                cfg.tiling.throttle_slow_apps,
             )
         };
         let mut tiler = ScrollTiler::new(padding, resize_increment, screen_size);
         tiler.set_smoothing(smooth_enabled, smooth_factor);
+        tiler.set_throttle_slow_apps(throttle_slow_apps);
         let (overlay_window_id, overlay_window_creation_task) = create_overlay_window(screen_size);
         (
             Self {

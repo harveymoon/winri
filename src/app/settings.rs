@@ -11,7 +11,7 @@
 
 use iced::{
     Alignment, Element, Length, Padding,
-    widget::{Space, button, column, container, row, scrollable, text, text_input},
+    widget::{Space, button, checkbox, column, container, row, scrollable, text, text_input},
 };
 
 use crate::{app, config};
@@ -34,6 +34,7 @@ pub struct SettingsForm {
     pub active_tab: SettingsTab,
     pub padding: String,
     pub resize_increment: String,
+    pub throttle_slow_apps: bool,
     pub ignored_processes: Vec<String>,
     pub ignored_classes: Vec<String>,
     /// Per-window persistent ignores. Editable here so users can review
@@ -59,6 +60,7 @@ pub enum SettingsMessage {
     TabSelected(SettingsTab),
     PaddingChanged(String),
     ResizeIncrementChanged(String),
+    ThrottleSlowAppsChanged(bool),
     NewProcessChanged(String),
     AddProcess,
     AddProcessByName(String),
@@ -80,6 +82,7 @@ impl SettingsForm {
             active_tab: SettingsTab::default(),
             padding: cfg.tiling.padding.to_string(),
             resize_increment: cfg.tiling.resize_increment.to_string(),
+            throttle_slow_apps: cfg.tiling.throttle_slow_apps,
             ignored_processes: cfg.filter.ignored_processes.clone(),
             ignored_classes: cfg.filter.ignored_classes.clone(),
             ignored_window_titles: cfg.filter.ignored_window_titles.clone(),
@@ -115,6 +118,7 @@ impl SettingsForm {
                 resize_increment,
                 smooth_scroll,
                 smooth_scroll_factor,
+                throttle_slow_apps: self.throttle_slow_apps,
             },
             filter: config::FilterConfig {
                 ignored_processes: self.ignored_processes.clone(),
@@ -137,6 +141,10 @@ pub fn update(form: &mut SettingsForm, message: SettingsMessage) -> bool {
         }
         SettingsMessage::ResizeIncrementChanged(v) => {
             form.resize_increment = v;
+            form.status = None;
+        }
+        SettingsMessage::ThrottleSlowAppsChanged(v) => {
+            form.throttle_slow_apps = v;
             form.status = None;
         }
         SettingsMessage::NewProcessChanged(v) => form.new_process = v,
@@ -187,6 +195,7 @@ pub fn update(form: &mut SettingsForm, message: SettingsMessage) -> bool {
                 let cfg = config::current();
                 form.padding = cfg.tiling.padding.to_string();
                 form.resize_increment = cfg.tiling.resize_increment.to_string();
+                form.throttle_slow_apps = cfg.tiling.throttle_slow_apps;
                 form.ignored_processes = cfg.filter.ignored_processes.clone();
                 form.ignored_classes = cfg.filter.ignored_classes.clone();
                 form.ignored_window_titles = cfg.filter.ignored_window_titles.clone();
@@ -316,6 +325,16 @@ fn general_tab(form: &SettingsForm) -> Element<'_, app::Message> {
             &form.resize_increment,
             |v| msg(SettingsMessage::ResizeIncrementChanged(v)),
         ),
+        Space::new().height(Length::Fixed(6.0)),
+        checkbox(form.throttle_slow_apps)
+            .label("Throttle slow apps during scroll (File Explorer)")
+            .on_toggle(|v| msg(SettingsMessage::ThrottleSlowAppsChanged(v)))
+            .text_size(13),
+        text(
+            "Lowers SetWindowPos rate to slow apps (currently File Explorer) so they \
+             stay in sync with the strip during fast scrolls. Off = every app gets every frame."
+        )
+        .size(11),
         Space::new().height(Length::Fixed(6.0)),
         text(
             "Padding and resize step take effect on winri restart. Filter changes apply on save."

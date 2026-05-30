@@ -128,6 +128,8 @@ impl app::State {
                         let cfg = crate::config::current();
                         self.tiler
                             .set_smoothing(cfg.tiling.smooth_scroll, cfg.tiling.smooth_scroll_factor);
+                        self.tiler
+                            .set_throttle_slow_apps(cfg.tiling.throttle_slow_apps);
                     }
                     self.update_tiler()?;
                 }

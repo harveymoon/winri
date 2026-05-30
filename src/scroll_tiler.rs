@@ -43,7 +43,15 @@ pub struct ScrollAnimation {
 /// position. Populate this table from the `ScrollProfile` diagnostic
 /// logs after a few scrolls.
 const SLOW_PROCESS_FRAME_THROTTLE: &[(&str, u32)] = &[
-    // ("explorer.exe", 3),
+    // File Explorer's WPF/XAML UI thread can't keep up with
+    // 60 SetWindowPos/sec — per-scroll diagnostic logs showed
+    // 200–2000+px lag at scroll-end during fast scrolls, and
+    // 1–2px lag during slow scrolls. Cutting to ~20fps lets
+    // the WM_SIZE / repaint pipeline drain in time, and the
+    // user sees smooth in-sync motion instead of catch-up
+    // slide. Other apps (Chrome, Claude, Discord, Photon Fleet,
+    // TouchDesigner) measured at 0–2px lag and don't need it.
+    ("explorer.exe", 3),
 ];
 
 fn frame_throttle_for(process_name: &str) -> u32 {

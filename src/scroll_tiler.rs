@@ -1178,6 +1178,23 @@ impl ScrollTiler {
         if scroll_just_started {
             self.scroll_frame_index = 0;
             self.scroll_profile.start();
+            // Re-resolve throttle classification for any window still
+            // marked as "every frame". `process_name()` can transiently
+            // fail at item construction (just-spawned process not yet
+            // queryable, integrity-level race) and lock us into
+            // throttle=1 forever. Re-checking here is cheap (one Win32
+            // call per previously-unclassified window per scroll) and
+            // self-heals on the next scroll after the process settles.
+            for item in &mut self.windows {
+                if item.scroll_frame_throttle == 1 {
+                    if let Ok(name) = item.inner.process_name() {
+                        let t = frame_throttle_for(&name);
+                        if t > 1 {
+                            item.scroll_frame_throttle = t;
+                        }
+                    }
+                }
+            }
         }
         if animating_now {
             self.scroll_frame_index = self.scroll_frame_index.saturating_add(1);

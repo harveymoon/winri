@@ -44,7 +44,15 @@ use crate::app::subscription::global::GlobalMessage;
 /// We always fire the leading edge of a burst immediately; subsequent
 /// events that arrive within the cooldown coalesce into a single
 /// trailing fire at the end of the cooldown window.
-const WINDOW_HOOK_COOLDOWN: Duration = Duration::from_millis(200);
+///
+/// Raised from 200ms to 500ms: the leading edge still catches anything
+/// the user *initiated* with no delay (new window, focus change, drag
+/// start), so user-visible latency is unchanged. The trailing edge
+/// gates only the post-event re-sync — which is bounded by app-side
+/// chatter from things like Chromium's per-frame `LOCATIONCHANGE`
+/// storms. Cutting that rate 2.5x means ~60% less ambient snapshot
+/// work without anything feeling laggier in practice.
+const WINDOW_HOOK_COOLDOWN: Duration = Duration::from_millis(500);
 
 struct CoalescerState {
     /// `Some(Sender)` once `launch()` has run; `None` before that. The

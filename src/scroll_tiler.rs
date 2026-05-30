@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ops::Sub,
     time::{Duration, Instant},
 };
@@ -33,6 +33,74 @@ pub struct ScrollAnimation {
     pub target_offset: f32,
     pub start_time: Instant,
     pub duration: Duration,
+}
+
+/// Per-scroll-animation frame throttle for known-slow processes.
+/// Value `N` means "emit `SetWindowPos` to this process every `N`-th
+/// animation frame" — at 60Hz a throttle of 3 means 20 moves/sec
+/// instead of 60. We always issue a final `SetWindowPos` at scroll-end
+/// regardless of throttle so windows land at the correct rest
+/// position. Populate this table from the `ScrollProfile` diagnostic
+/// logs after a few scrolls.
+const SLOW_PROCESS_FRAME_THROTTLE: &[(&str, u32)] = &[
+    // ("explorer.exe", 3),
+];
+
+fn frame_throttle_for(process_name: &str) -> u32 {
+    for (name, throttle) in SLOW_PROCESS_FRAME_THROTTLE {
+        if process_name.eq_ignore_ascii_case(name) {
+            return *throttle;
+        }
+    }
+    1
+}
+
+/// Diagnostic counter for `SetWindowPos` activity during a scroll
+/// animation. Tracks per-HWND emit counts, total scroll duration, and
+/// total animation frames; logged as a single summary at scroll-end so
+/// we can tell which apps got how many position updates and how much
+/// they lag the rest of the strip when the scroll settles.
+#[derive(Default)]
+struct ScrollProfile {
+    start: Option<Instant>,
+    frame_count: u32,
+    counts: HashMap<u64, u32>,
+}
+
+struct ScrollProfileSnapshot {
+    duration: Duration,
+    frame_count: u32,
+    /// Sorted descending by emit count.
+    counts: Vec<(u64, u32)>,
+}
+
+impl ScrollProfile {
+    fn start(&mut self) {
+        self.start = Some(Instant::now());
+        self.frame_count = 0;
+        self.counts.clear();
+    }
+    fn tick_frame(&mut self) {
+        if self.start.is_some() {
+            self.frame_count = self.frame_count.saturating_add(1);
+        }
+    }
+    fn record(&mut self, hwnd: u64) {
+        if self.start.is_some() {
+            *self.counts.entry(hwnd).or_insert(0) += 1;
+        }
+    }
+    fn finish(&mut self) -> Option<ScrollProfileSnapshot> {
+        let start = self.start.take()?;
+        let counts = std::mem::take(&mut self.counts);
+        let mut sorted: Vec<(u64, u32)> = counts.into_iter().collect();
+        sorted.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        Some(ScrollProfileSnapshot {
+            duration: start.elapsed(),
+            frame_count: self.frame_count,
+            counts: sorted,
+        })
+    }
 }
 
 /// Represents a window managed by the tiler.
@@ -88,11 +156,22 @@ pub struct WindowItem {
     /// Width the tile had immediately before the window went iconic.
     /// Cleared as soon as it's been re-applied on restore.
     pre_minimize_width: Option<f32>,
+    /// Per-scroll-animation frame throttle, resolved once at
+    /// construction from `frame_throttle_for(process_name)`. Default 1
+    /// means "emit every frame"; values >1 cause the layout pass to
+    /// skip this window on `(scroll_frame_index % throttle) != 0`
+    /// during animations. The final settle frame always emits.
+    scroll_frame_throttle: u32,
 }
 
 impl WindowItem {
     pub fn new(inner: Window, width: f32) -> Self {
         let skip_clipping = inner.is_clip_unsafe().unwrap_or(false);
+        let scroll_frame_throttle = inner
+            .process_name()
+            .ok()
+            .as_deref()
+            .map_or(1, frame_throttle_for);
         Self {
             inner,
             requested_width: Some(width),
@@ -104,6 +183,7 @@ impl WindowItem {
             skip_clipping,
             was_iconic_last_tick: false,
             pre_minimize_width: None,
+            scroll_frame_throttle,
         }
     }
 
@@ -170,6 +250,16 @@ pub struct ScrollTiler {
     /// ends, which is when we re-check whether any tiled window has been
     /// pulled off the tiling monitor.
     was_mouse_held_last_snapshot: bool,
+    /// Animation-frame counter; resets to 0 at scroll-start, increments
+    /// once per `layout_windows` call while `is_animating()`. Used to
+    /// implement per-process scroll-frame throttling.
+    scroll_frame_index: u32,
+    /// `is_animating()` result from the previous `layout_windows` call,
+    /// used to detect scroll-start (false→true) and scroll-end
+    /// (true→false) edges for the profile + throttle logic.
+    was_animating_last_layout: bool,
+    /// Diagnostic counter; see `ScrollProfile`.
+    scroll_profile: ScrollProfile,
 }
 
 impl ScrollTiler {
@@ -1070,6 +1160,22 @@ impl ScrollTiler {
             return;
         }
 
+        // Animation transition detection. `is_animating()` covers
+        // exponential scroll smoothing, time-based scroll animations,
+        // and per-window width animations — anything that should be
+        // throttled / profiled as a single scroll event.
+        let animating_now = self.is_animating();
+        let scroll_just_started = !self.was_animating_last_layout && animating_now;
+        let scroll_just_ended = self.was_animating_last_layout && !animating_now;
+        if scroll_just_started {
+            self.scroll_frame_index = 0;
+            self.scroll_profile.start();
+        }
+        if animating_now {
+            self.scroll_frame_index = self.scroll_frame_index.saturating_add(1);
+            self.scroll_profile.tick_frame();
+        }
+
         // A rect "actually changed" tolerance — DWM bounds round-trips can
         // jitter a fraction of a pixel; we don't want to count that as
         // motion and disturb the border fade.
@@ -1193,18 +1299,37 @@ impl ScrollTiler {
             if !changed {
                 continue;
             }
-            moved_any = true;
-            match item.inner.padded_rect(
+            // Per-process scroll-frame throttle. While scrolling,
+            // known-slow processes get SetWindowPos every Nth frame
+            // instead of every frame so their UI thread can keep up
+            // with the repaint cost. At rest (!animating_now,
+            // including the scroll_just_ended frame), emit
+            // unconditionally so the window lands at its real
+            // resting position.
+            if animating_now
+                && item.scroll_frame_throttle > 1
+                && self.scroll_frame_index % item.scroll_frame_throttle != 0
+            {
+                continue;
+            }
+            let hwnd = item.inner.handle();
+            let hwnd_raw = hwnd.0 as u64;
+            let padded = item.inner.padded_rect(
                 [d.place_x, d.place_y].into(),
                 [d.target_w, d.target_h].into(),
-            ) {
-                Ok((x, y, w, h)) => batch.push(crate::window::BatchMove {
-                    hwnd: item.inner.handle(),
-                    x,
-                    y,
-                    width: w,
-                    height: h,
-                }),
+            );
+            match padded {
+                Ok((x, y, w, h)) => {
+                    batch.push(crate::window::BatchMove {
+                        hwnd,
+                        x,
+                        y,
+                        width: w,
+                        height: h,
+                    });
+                    moved_any = true;
+                    self.scroll_profile.record(hwnd_raw);
+                }
                 Err(e) => warn!("padded_rect failed during layout: {e}"),
             }
         }
@@ -1300,6 +1425,43 @@ impl ScrollTiler {
         }
         if moved_any {
             self.mark_motion();
+        }
+
+        // Update animation-state transition tracking and, on the
+        // scroll-end frame, log the per-app SetWindowPos profile.
+        self.was_animating_last_layout = animating_now;
+        if scroll_just_ended {
+            if let Some(snap) = self.scroll_profile.finish() {
+                let parts: Vec<String> = snap
+                    .counts
+                    .iter()
+                    .take(15)
+                    .map(|(hwnd_raw, count)| {
+                        let item = self
+                            .windows
+                            .iter()
+                            .find(|w| w.inner.handle().0 as u64 == *hwnd_raw);
+                        let process = item
+                            .map(|w| w.inner.process_name().unwrap_or_default())
+                            .unwrap_or_default();
+                        let lag_px = item
+                            .and_then(|w| {
+                                let (lx, _ly, _lw, _lh) = w.last_layout?;
+                                let bounds = w.inner.desktop_manager_bounds().ok()?;
+                                Some((bounds.position().x() - lx).abs())
+                            })
+                            .unwrap_or(0.0);
+                        format!("{process}={count}/{}@{lag_px:.0}px", snap.frame_count)
+                    })
+                    .collect();
+                info!(
+                    "ScrollProfile: {}ms, {} frames, {} apps moved: {}",
+                    snap.duration.as_millis(),
+                    snap.frame_count,
+                    snap.counts.len(),
+                    parts.join(", ")
+                );
+            }
         }
     }
 

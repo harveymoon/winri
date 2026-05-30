@@ -585,7 +585,7 @@ impl app::State {
         let mut cfg = crate::config::current().clone();
         let already = cfg.filter.ignored_window_titles.iter().any(|e| {
             e.process == process
-                && e.title == title
+                && e.title.as_deref() == Some(title.as_str())
                 && e.class.as_deref() == class_opt.as_deref()
         });
         if !already {
@@ -593,7 +593,8 @@ impl app::State {
                 .ignored_window_titles
                 .push(crate::config::IgnoredWindowTitle {
                     process: process.clone(),
-                    title: title.clone(),
+                    title: Some(title.clone()),
+                    title_starts_with: None,
                     class: class_opt.clone(),
                 });
             crate::config::save(cfg)

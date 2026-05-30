@@ -549,10 +549,16 @@ fn per_window_section(form: &SettingsForm) -> Element<'_, app::Message> {
             .class
             .as_deref()
             .map_or_else(|| "(any class)".to_string(), |c| c.to_string());
-        let title_str = if entry.title.is_empty() {
-            "(empty title)".to_string()
+        let title_str = if let Some(prefix) = entry.title_starts_with.as_deref() {
+            format!("starts: {prefix}")
+        } else if let Some(t) = entry.title.as_deref() {
+            if t.is_empty() {
+                "(empty title)".to_string()
+            } else {
+                t.to_string()
+            }
         } else {
-            entry.title.clone()
+            "(no title rule)".to_string()
         };
 
         // Single-line compact: process · class · title · ×

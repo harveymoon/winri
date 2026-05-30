@@ -272,7 +272,7 @@ impl State {
         let mut cfg = config::current().clone();
         let already = cfg.filter.ignored_window_titles.iter().any(|e| {
             e.process == process
-                && e.title == title
+                && e.title.as_deref() == Some(title.as_str())
                 && e.class.as_deref() == Some(class.as_str())
         });
         if !already {
@@ -280,7 +280,8 @@ impl State {
                 .ignored_window_titles
                 .push(config::IgnoredWindowTitle {
                     process: process.clone(),
-                    title: title.clone(),
+                    title: Some(title.clone()),
+                    title_starts_with: None,
                     class: Some(class.clone()),
                 });
             config::save(cfg).context("saving config after Ignore focused window")?;

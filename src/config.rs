@@ -109,7 +109,17 @@ pub struct FilterConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IgnoredWindowTitle {
     pub process: String,
-    pub title: String,
+    /// Exact title match. Set this OR `title_starts_with`, not both.
+    /// `Option` (rather than required `String`) so a config entry can
+    /// use the prefix-match form instead.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Title prefix match. Use for apps whose ignored window has a
+    /// constant prefix and varying suffix — e.g. Sigma File Manager's
+    /// Quick View popup titles as `"Sigma File Manager | Quick View
+    /// - IMG_6135.jpg"` where the filename changes per-file.
+    #[serde(default)]
+    pub title_starts_with: Option<String>,
     /// Optional Win32 window class. When present the match also requires
     /// `class` equality, which keeps a popup from accidentally silencing
     /// its app's main window when both share the same class but differ
@@ -117,6 +127,32 @@ pub struct IgnoredWindowTitle {
     /// the previous (process, title)-only behaviour.
     #[serde(default)]
     pub class: Option<String>,
+}
+
+impl IgnoredWindowTitle {
+    /// Does this rule match the given window? `process` and `class` are
+    /// strict (when `class` is `Some`); title is either exact or
+    /// prefix-matched per the rule's configuration.
+    pub fn matches(&self, process: &str, title: &str, class: &str) -> bool {
+        if self.process != process {
+            return false;
+        }
+        let title_ok = if let Some(prefix) = &self.title_starts_with {
+            title.starts_with(prefix.as_str())
+        } else if let Some(exact) = &self.title {
+            exact == title
+        } else {
+            // Neither title nor title_starts_with set — invalid rule;
+            // treat as non-matching so users see a stale config behave
+            // safely (window stays tiled) rather than nuking everything
+            // from this process.
+            false
+        };
+        if !title_ok {
+            return false;
+        }
+        self.class.as_deref().is_none_or(|c| c == class)
+    }
 }
 
 const DEFAULT_CONFIG_TOML: &str = r#"# Winri configuration

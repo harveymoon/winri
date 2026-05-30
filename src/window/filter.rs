@@ -81,9 +81,7 @@ pub fn should_be_tiled(window: Window) -> anyhow::Result<bool> {
             .filter
             .ignored_window_titles
             .iter()
-            .any(|e| e.process == process
-                && e.title == title_str
-                && e.class.as_deref().map_or(true, |c| c == class.as_str()))
+            .any(|e| e.matches(&process, &title_str, &class))
     );
     drop(user_cfg);
 

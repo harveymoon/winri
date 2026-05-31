@@ -110,6 +110,7 @@ impl SettingsForm {
         let monitors = live.monitors.clone();
         let smooth_scroll = live.tiling.smooth_scroll;
         let smooth_scroll_factor = live.tiling.smooth_scroll_factor;
+        let app_overrides = live.app_overrides.clone();
         drop(live);
 
         Ok(config::Config {
@@ -127,6 +128,7 @@ impl SettingsForm {
             },
             api,
             monitors,
+            app_overrides,
         })
     }
 }

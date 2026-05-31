@@ -21,6 +21,41 @@ pub struct Config {
     pub filter: FilterConfig,
     pub api: ApiConfig,
     pub monitors: MonitorsConfig,
+    /// Per-app display overrides. Apps whose `process_name` doesn't
+    /// uniquely identify them (notably Electron apps, which all report
+    /// `electron.exe`) can be matched by exe path substring and given
+    /// a friendlier display name and custom icon.
+    #[serde(default)]
+    pub app_overrides: Vec<AppOverride>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppOverride {
+    /// Substring that must appear in the window's full exe path for
+    /// this override to apply. Case-insensitive. Example:
+    /// `"cool_browser"` matches `C:/CODE/cool_browser/build/electron.exe`.
+    pub exe_path_contains: String,
+    /// Display name to show in the overview and settings instead of the
+    /// (often misleading) executable basename.
+    pub display_name: String,
+    /// Optional path to a `.ico` (or any `LoadImageW`-readable image)
+    /// to render as the app icon in overview tiles. If omitted, falls
+    /// back to whatever the window itself exposes via `WM_GETICON`
+    /// (which for Electron dev builds is usually the generic Electron
+    /// icon — exactly what this override is fixing).
+    #[serde(default)]
+    pub icon_path: Option<String>,
+}
+
+impl AppOverride {
+    /// Does this override apply to `exe_path`? Match is case-insensitive
+    /// because the user might type `cool_browser` but the actual path
+    /// has `Cool_Browser` or vice versa.
+    pub fn matches(&self, exe_path: &str) -> bool {
+        exe_path
+            .to_lowercase()
+            .contains(&self.exe_path_contains.to_lowercase())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,6 +242,15 @@ port = 47812
 # monitor; alternatively use a Win32 device name like "\\.\DISPLAY2".
 # Windows on other monitors are left as normal floating windows.
 tiling_monitor = "primary"
+
+# Per-app display overrides — give Electron apps (and any others whose
+# process name is generic) a friendlier label and custom icon in the
+# overview. Match is case-insensitive substring on the full exe path.
+# Example:
+# [[app_overrides]]
+# exe_path_contains = "cool_browser"
+# display_name = "cool"
+# icon_path = "C:/CODE/cool_browser/build/icon.ico"
 "#;
 
 static CONFIG: OnceLock<RwLock<Config>> = OnceLock::new();

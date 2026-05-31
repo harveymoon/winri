@@ -345,6 +345,29 @@ impl Window {
         Ok(process_name)
     }
 
+    /// Full path to the window's owning executable (e.g.
+    /// `C:\Program Files\Foo\bar.exe`). Returned with forward slashes
+    /// normalised so config-time path matching doesn't have to care
+    /// about escaping. Used by `config.app_overrides` so Electron-based
+    /// apps that all report `process_name = "electron.exe"` can be
+    /// disambiguated by where their bundle lives on disk.
+    pub fn exe_path(self) -> anyhow::Result<String> {
+        ensure_valid!(self);
+        let process_id = self.process_id()?;
+        let process = wincall_result!(OpenProcess(
+            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+            false,
+            process_id,
+        ))?;
+        let _guard = ProcessHandleGuard(process);
+
+        let mut buf = vec![0u16; 1024];
+        let _ = wincall_into_result!(GetModuleFileNameExW(Some(process), None, &mut buf))?;
+        let path =
+            unsafe { windows_strings::PCWSTR::from_raw(buf.as_ptr()).to_string() }?;
+        Ok(path.replace('\\', "/"))
+    }
+
     pub fn class(self) -> anyhow::Result<String> {
         ensure_valid!(self);
         let mut class = vec![0u16; 256];

@@ -12,7 +12,8 @@ use windows::Win32::{
     },
     UI::WindowsAndMessaging::{
         GCLP_HICON, GCLP_HICONSM, GET_CLASS_LONG_INDEX, GetClassLongPtrW, GetIconInfo, HICON,
-        ICONINFO, SMTO_ABORTIFHUNG, SendMessageTimeoutW,
+        ICONINFO, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE, LR_SHARED, LoadImageW,
+        SMTO_ABORTIFHUNG, SendMessageTimeoutW,
     },
 };
 
@@ -158,5 +159,32 @@ fn hicon_to_rgba(hicon: HICON) -> Option<(u32, u32, Vec<u8>)> {
 /// representation, or `None` if it doesn't expose one.
 pub fn fetch_icon_rgba(hwnd_raw: u64) -> Option<(u32, u32, Vec<u8>)> {
     let hicon = fetch_hicon(hwnd_raw)?;
+    hicon_to_rgba(hicon)
+}
+
+/// Load an icon from a file path (typically a `.ico`) and convert to
+/// RGBA. Used by `config.app_overrides[*].icon_path` so Electron apps
+/// can display their bundled icon in the overview instead of the
+/// generic frame icon they advertise to `WM_GETICON`. Returns `None`
+/// on any failure (file missing, unreadable format, etc.) so callers
+/// can transparently fall back to the HWND-derived icon.
+pub fn load_icon_rgba_from_path(path: &str) -> Option<(u32, u32, Vec<u8>)> {
+    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    let pcwstr = windows_strings::PCWSTR::from_raw(wide.as_ptr());
+    let handle = unsafe {
+        LoadImageW(
+            None,
+            pcwstr,
+            IMAGE_ICON,
+            0,
+            0,
+            LR_LOADFROMFILE | LR_DEFAULTSIZE | LR_SHARED,
+        )
+    }
+    .ok()?;
+    if handle.0.is_null() {
+        return None;
+    }
+    let hicon = HICON(handle.0);
     hicon_to_rgba(hicon)
 }

@@ -304,20 +304,42 @@ impl app::State {
                         .ok()
                         .flatten()
                         .unwrap_or_default();
-                    let app_name = window
-                        .inner
-                        .process_name()
-                        .ok()
-                        .map_or_else(String::new, |p| process_name_to_app_name(&p));
 
-                    // Best-effort app-icon fetch. None is fine — the view
-                    // simply omits the icon and falls back to text-only.
-                    let icon = crate::icon::fetch_icon_rgba(window.inner.handle().0 as u64)
-                        .map(|(w, h, rgba)| {
-                            let handle =
-                                iced::widget::image::Handle::from_rgba(w, h, rgba);
-                            (w, h, handle)
+                    // Config-driven app override resolved from the
+                    // window's full exe path. Used so Electron-frame
+                    // apps (which all share `process_name = "electron.exe"`
+                    // and report the generic Electron HICON) can present
+                    // their own name and bundled icon.
+                    let exe_path = window.inner.exe_path().ok();
+                    let cfg = crate::config::current();
+                    let override_match = exe_path
+                        .as_deref()
+                        .and_then(|p| cfg.app_overrides.iter().find(|o| o.matches(p)).cloned());
+                    drop(cfg);
+
+                    let app_name = if let Some(o) = &override_match {
+                        o.display_name.clone()
+                    } else {
+                        window
+                            .inner
+                            .process_name()
+                            .ok()
+                            .map_or_else(String::new, |p| process_name_to_app_name(&p))
+                    };
+
+                    // Icon: prefer override-supplied path, fall back to
+                    // whatever the window exposes via WM_GETICON.
+                    let icon_rgba = override_match
+                        .as_ref()
+                        .and_then(|o| o.icon_path.as_deref())
+                        .and_then(crate::icon::load_icon_rgba_from_path)
+                        .or_else(|| {
+                            crate::icon::fetch_icon_rgba(window.inner.handle().0 as u64)
                         });
+                    let icon = icon_rgba.map(|(w, h, rgba)| {
+                        let handle = iced::widget::image::Handle::from_rgba(w, h, rgba);
+                        (w, h, handle)
+                    });
 
                     thumbnails.push(Thumbnail {
                         thumbnail_id,

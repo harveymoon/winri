@@ -123,7 +123,7 @@ pub enum Message {
 }
 
 impl app::State {
-    pub fn prepare_open_overview(&self) -> Task<app::Message> {
+    pub fn prepare_open_overview(&mut self) -> Task<app::Message> {
         if matches!(self.mode, Mode::Overview(_)) {
             log::warn!(
                 "Overview operation requested in {} while already in Overview mode",
@@ -132,10 +132,32 @@ impl app::State {
             return Task::none();
         }
 
+        // Refuse to open overview if the settings panel is already up.
+        // This prevents the "queued hotkeys after a freeze" cascade:
+        // a frozen app stalls the tiler, the OS buffers Win+, and
+        // Win+Up, then both fire back-to-back when the loop unwedges
+        // — overview parks every tile offscreen and the settings
+        // window sits in front of the (now invisible) overview UI,
+        // leaving the user with no on-screen tiles and no obvious
+        // way to recover. (May 2026 incident.)
+        if self.settings_window_id.is_some() {
+            log::warn!(
+                "Overview suppressed: settings panel is open. Close settings first."
+            );
+            return Task::none();
+        }
+
         let monitors = crate::monitor::enumerate();
         if monitors.is_empty() {
             return Task::none();
         }
+
+        // Mark "overview is opening" synchronously, before returning the
+        // creation tasks. The async gap between this batch and
+        // `finalize_open_overview` flipping `self.mode` is exactly when a
+        // queued `Win+,` would otherwise slip past the settings guard.
+        // Cleared in every `finalize_open_overview` exit path.
+        self.overview_opening = true;
 
         // One window-creation task per monitor, batched together.
         Task::batch(monitors.into_iter().map(|m| {
@@ -160,7 +182,12 @@ impl app::State {
                     // failing here would orphan it. Close it explicitly so
                     // the user doesn't end up with an empty transparent
                     // window stuck on screen.
+                    //
+                    // Also drop `overview_opening` so the settings guard
+                    // can't get permanently wedged shut by a failed
+                    // overview open.
                     log::warn!("Overview finalize failed; closing orphan window: {e:#}");
+                    self.overview_opening = false;
                     Ok(iced::window::close::<app::Message>(id))
                 }
             },
@@ -192,6 +219,9 @@ impl app::State {
             self.mode = Mode::Overview(State {
                 monitors: Vec::new(),
             });
+            // `Mode::Overview` is now the active guard; clear the
+            // synchronous opening flag set in `prepare_open_overview`.
+            self.overview_opening = false;
         }
 
         // Find the matching `Monitor` so we can read its work area and

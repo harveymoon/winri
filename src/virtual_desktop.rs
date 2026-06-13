@@ -85,6 +85,29 @@ where
     })
 }
 
+/// Drop the cached `IVirtualDesktopManager` and forget every
+/// `GetWindowDesktopId` result. The next call to [`desktop_id_for`]
+/// will rebuild the COM proxy via `CoCreateInstance`.
+///
+/// Call when DWM has restarted: the cached COM proxy was bound to
+/// the dead `dwm.exe`'s apartment, so its methods either return
+/// E_HANDLE indefinitely or marshal back stale data. Releasing it
+/// also avoids dropping a disconnected proxy at shutdown, which can
+/// surface as a fatal exception inside windows-rs's `Release` path.
+///
+/// Thread-local scope: this only clears state on the calling thread.
+/// In practice every caller (`desktop_id_for`, `get_dm_attribute`'s
+/// callers) runs on the iced main thread, so a single call from the
+/// DWM-health gate is enough.
+pub fn invalidate_cached_manager() {
+    MANAGER.with(|cell| {
+        *cell.borrow_mut() = None;
+    });
+    HWND_GUID_CACHE.with(|cache| {
+        cache.borrow_mut().clear();
+    });
+}
+
 fn registry() -> &'static Mutex<Vec<GUID>> {
     static REG: OnceLock<Mutex<Vec<GUID>>> = OnceLock::new();
     REG.get_or_init(|| Mutex::new(Vec::new()))

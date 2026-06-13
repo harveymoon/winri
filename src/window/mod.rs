@@ -33,6 +33,96 @@ use crate::{
 
 pub type SafeHWND = u64;
 
+/// Per-window timeout for the `WM_NULL` probe that precedes
+/// `SetWindowRgn`. A slow-but-not-ghosted app (TouchDesigner,
+/// Photoshop, etc.) can keep its message pump alive at a few-hundred-
+/// ms cadence — long enough to dodge `IsHungAppWindow` but long
+/// enough to stall a synchronous `SetWindowRgn` for seconds. 50 ms
+/// is loose enough not to false-positive on a normal app under
+/// load, tight enough that a full strip of 14 stuck windows costs
+/// at most ~700 ms instead of the 29-second freeze we observed.
+const SETWINDOWRGN_PROBE_MS: u32 = 50;
+
+/// Process-wide gate that suppresses `DwmGetWindowAttribute` calls
+/// during the dwm.exe restart window.
+///
+/// When DWM restarts (graphics driver reset, dwm.exe crash, certain
+/// theme/display changes), every `DwmGetWindowAttribute` call returns
+/// `E_HANDLE` (0x80070006) for *every* HWND — the kernel handles are
+/// still valid but DWM has dropped its per-window state. Our snapshot
+/// tick fires `desktop_manager_bounds()` per window per tick, so each
+/// dead second produces dozens of identical errors in the log and
+/// keeps hammering the half-restarted DWM with cross-apartment RPC.
+///
+/// The gate is a single timestamp. On E_HANDLE we set "don't call
+/// again until now+250 ms" and log once. Probes after the cooldown
+/// fall through; success clears the gate and logs once. While the
+/// gate is held we also drop the cached `IVirtualDesktopManager` so
+/// the next caller pulls a fresh COM proxy against the new dwm.exe.
+mod dwm_health {
+    use std::{
+        sync::{
+            OnceLock,
+            atomic::{AtomicU64, Ordering},
+        },
+        time::{Duration, Instant},
+    };
+
+    const DWM_BACKOFF: Duration = Duration::from_millis(250);
+
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    /// Milliseconds since `EPOCH` after which calls may probe again.
+    /// `0` means healthy; any non-zero value means we're in backoff
+    /// and callers should skip until `now_ms() >= retry_at_ms`.
+    static RETRY_AT_MS: AtomicU64 = AtomicU64::new(0);
+
+    fn now_ms() -> u64 {
+        let epoch = *EPOCH.get_or_init(Instant::now);
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "u128 → u64 truncation only matters after ~584 million years uptime"
+        )]
+        {
+            Instant::now().saturating_duration_since(epoch).as_millis() as u64
+        }
+    }
+
+    /// Returns `true` if a `DwmGetWindowAttribute` call should
+    /// proceed. Returns `false` while the backoff window is active.
+    pub fn allow_call() -> bool {
+        let retry_at = RETRY_AT_MS.load(Ordering::Relaxed);
+        retry_at == 0 || now_ms() >= retry_at
+    }
+
+    /// Note an `E_HANDLE` from `DwmGetWindowAttribute`. Arms the
+    /// backoff window. Logs (and invalidates the cached virtual-
+    /// desktop manager) only on the healthy→unhealthy transition.
+    pub fn mark_unhealthy() {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "DWM_BACKOFF is 250 ms; u128 → u64 is lossless"
+        )]
+        let next = now_ms() + DWM_BACKOFF.as_millis() as u64;
+        let prev = RETRY_AT_MS.swap(next, Ordering::Relaxed);
+        if prev == 0 {
+            log::warn!(
+                "DWM unavailable (E_HANDLE from DwmGetWindowAttribute) — backing off DwmGetWindowAttribute for {:?}; invalidating cached IVirtualDesktopManager",
+                DWM_BACKOFF
+            );
+            crate::virtual_desktop::invalidate_cached_manager();
+        }
+    }
+
+    /// Note a successful `DwmGetWindowAttribute`. Clears the gate
+    /// and logs once on the unhealthy→healthy transition.
+    pub fn mark_healthy() {
+        let prev = RETRY_AT_MS.swap(0, Ordering::Relaxed);
+        if prev != 0 {
+            log::info!("DWM responsive again");
+        }
+    }
+}
+
 /// RAII closer for an `OpenProcess` HANDLE. Dropping it calls `CloseHandle`
 /// so the handle is released on every path including early-returns.
 struct ProcessHandleGuard(HANDLE);
@@ -179,6 +269,59 @@ impl Window {
         unsafe { IsIconic(self.handle()) }.as_bool()
     }
 
+    /// `true` if Windows has flagged this window as "not responding" —
+    /// it stopped pumping messages long enough for DWM to ghost it
+    /// (~5 s). Cheap lookup of an internal flag; does **not** send a
+    /// probe message itself. Used to skip synchronous Win32 calls
+    /// (`SetWindowRgn`, etc.) that would otherwise block the tiler's
+    /// main thread until the target app's UI thread unwedges.
+    /// A 36-second `SetWindowRgn` stall on a frozen Chrome window
+    /// caused the entire winri main loop to hang in May 2026 — this
+    /// guard exists so one hung app can't take down the whole tiler.
+    pub fn is_hung(self) -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::IsHungAppWindow;
+        unsafe { IsHungAppWindow(self.handle()) }.as_bool()
+    }
+
+    /// Send a `WM_NULL` probe via `SendMessageTimeoutW` and report
+    /// whether the target's UI thread acknowledged it within
+    /// `timeout_ms`. `WM_NULL` does nothing — it just round-trips
+    /// through the target's message queue, so the response timing
+    /// tells us whether the thread is pumping messages right now.
+    ///
+    /// Complements `is_hung()`, which only catches DWM-ghosted apps
+    /// (~5 s stall threshold). An app doing a heavy synchronous
+    /// repaint or GPU drain (TouchDesigner, Photoshop, video editors)
+    /// can stall message-pumping for seconds at a time without
+    /// crossing the ghost threshold. Without this probe, the
+    /// subsequent `SetWindowRgn` synchronously blocks on the slow
+    /// target until it processes `WM_WINDOWPOSCHANGING` — which is
+    /// the 29-second freeze we hit on May 31 2026 against
+    /// `TouchDesigner.exe` (1 frame in 29.4 s).
+    ///
+    /// `SMTO_ABORTIFHUNG` short-circuits if the OS has already
+    /// marked the app as hung. The function still blocks for up to
+    /// `timeout_ms` for slow-but-not-hung targets — that's the cap
+    /// on per-window stall in the scroll-start clip pass.
+    pub fn is_responsive(self, timeout_ms: u32) -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_NULL,
+        };
+        let mut result: usize = 0;
+        let ret = unsafe {
+            SendMessageTimeoutW(
+                self.handle(),
+                WM_NULL,
+                WPARAM::default(),
+                LPARAM::default(),
+                SMTO_ABORTIFHUNG,
+                timeout_ms,
+                Some(&raw mut result),
+            )
+        };
+        ret.0 != 0
+    }
+
     pub fn enumerate() -> anyhow::Result<Vec<Self>> {
         unsafe extern "system" fn enum_callback(window: HWND, out_list: LPARAM) -> BOOL {
             let list = unsafe { &mut *(out_list.0 as *mut Vec<Window>) };
@@ -203,18 +346,50 @@ impl Window {
         attribute: DWMWINDOWATTRIBUTE,
         result: &mut T,
     ) -> anyhow::Result<()> {
+        // Bail without an RPC round-trip while DWM is mid-restart;
+        // see `dwm_health` for the rationale.
+        if !dwm_health::allow_call() {
+            return Err(anyhow::anyhow!(
+                "DwmGetWindowAttribute({}) suppressed: DWM in backoff window",
+                attribute.0
+            ));
+        }
+
         #[allow(
             clippy::cast_possible_truncation,
             reason = "size of small struct will never be large enough to be truncated"
         )]
-        wincall_result!(DwmGetWindowAttribute(
-            self.handle(),
-            attribute,
-            std::ptr::from_mut::<T>(result).cast::<c_void>(),
-            std::mem::size_of::<T>() as u32,
-        ))
-        .context(attribute.0)?;
-        Ok(())
+        let res = unsafe {
+            DwmGetWindowAttribute(
+                self.handle(),
+                attribute,
+                std::ptr::from_mut::<T>(result).cast::<c_void>(),
+                std::mem::size_of::<T>() as u32,
+            )
+        };
+
+        match res {
+            Ok(()) => {
+                dwm_health::mark_healthy();
+                Ok(())
+            }
+            Err(e) => {
+                // Callers (`desktop_manager_bounds`, `is_cloaked`) call
+                // `ensure_valid!(self)` before us, so E_HANDLE here is a
+                // DWM-level failure, not a dead HWND. Race-window false
+                // positives self-heal after the 250 ms cooldown.
+                #[allow(
+                    clippy::cast_sign_loss,
+                    reason = "HRESULT is a signed bit pattern; compare as u32"
+                )]
+                if (e.code().0 as u32) == 0x8007_0006 {
+                    dwm_health::mark_unhealthy();
+                }
+                Err(anyhow::Error::new(e))
+                    .context("winri::window::Window::get_dm_attribute")
+                    .context(attribute.0)
+            }
+        }
     }
 
     fn get_window_long(self, attribute: WINDOW_LONG_PTR_INDEX) -> anyhow::Result<i32> {
@@ -462,6 +637,25 @@ impl Window {
         bottom: i32,
     ) -> anyhow::Result<()> {
         ensure_valid!(self);
+        // `SetWindowRgn` synchronously dispatches `WM_WINDOWPOSCHANGING`
+        // to the target and waits — a hung target app's stuck UI thread
+        // would block the tiler's main thread until DWM ghosts it.
+        // Skip the clip on hung windows; the next layout pass picks
+        // them back up once they unwedge. See `Window::is_hung`.
+        if self.is_hung() {
+            return Err(anyhow::anyhow!("target window is hung"));
+        }
+        // Slow-but-not-ghosted defence (TouchDesigner et al.): probe
+        // with a `WM_NULL` round-trip; if it doesn't return within
+        // the budget, the target's UI thread is busy and the
+        // `SetWindowRgn` call below would stall on it for seconds.
+        // See `Window::is_responsive`.
+        if !self.is_responsive(SETWINDOWRGN_PROBE_MS) {
+            return Err(anyhow::anyhow!(
+                "target window did not respond within {}ms",
+                SETWINDOWRGN_PROBE_MS
+            ));
+        }
         use windows::Win32::Graphics::Gdi::{CreateRectRgn, DeleteObject, HGDIOBJ, SetWindowRgn};
         let hrgn = unsafe { CreateRectRgn(left, top, right, bottom) };
         if hrgn.is_invalid() {
@@ -487,6 +681,20 @@ impl Window {
     /// shape changed" which makes DWM rebuild the modern frame.
     pub fn clear_visible_region(self) -> anyhow::Result<()> {
         ensure_valid!(self);
+        // Same blocking concern as `set_visible_region`: `SetWindowRgn`
+        // is synchronous and a hung target stalls our caller. Skip
+        // hung windows — a leftover clip on a hung app is preferable
+        // to freezing the whole tiler, and the next non-hung pass
+        // will clear it.
+        if self.is_hung() {
+            return Err(anyhow::anyhow!("target window is hung"));
+        }
+        if !self.is_responsive(SETWINDOWRGN_PROBE_MS) {
+            return Err(anyhow::anyhow!(
+                "target window did not respond within {}ms",
+                SETWINDOWRGN_PROBE_MS
+            ));
+        }
         use windows::Win32::{
             Graphics::Gdi::SetWindowRgn,
             UI::WindowsAndMessaging::{

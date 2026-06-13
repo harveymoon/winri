@@ -1422,14 +1422,21 @@ impl ScrollTiler {
         // and the inner check makes subsequent frames effectively
         // no-ops. On settle (`!animating`), we re-evaluate and apply the
         // correct clip for the resting state.
+        // `last_clip` mirrors the OS state. Updating it on the `Err`
+        // path of `clear_visible_region` (hung / slow app) would mark
+        // the window unclipped while the OS still has the clip on, and
+        // since these branches are gated on `last_clip.is_some()` the
+        // failed clear would never be retried — the window would stay
+        // visually truncated until a fresh `set_visible_region` ran.
+        // Keep `last_clip` in sync with reality: only null it on `Ok`.
         if animating {
             for d in &decisions {
                 let item = &mut self.windows[d.idx];
                 if item.last_clip.is_some() {
-                    if let Err(e) = item.inner.clear_visible_region() {
-                        warn!("clear_visible_region (scroll-start clear) failed: {e}");
+                    match item.inner.clear_visible_region() {
+                        Ok(()) => item.last_clip = None,
+                        Err(e) => warn!("clear_visible_region (scroll-start clear) failed: {e}"),
                     }
-                    item.last_clip = None;
                 }
             }
         } else {
@@ -1441,26 +1448,26 @@ impl ScrollTiler {
                 // it once and move on. See `Window::is_clip_unsafe`.
                 if item.skip_clipping {
                     if item.last_clip.is_some() {
-                        if let Err(e) = item.inner.clear_visible_region() {
-                            warn!("clear_visible_region (chromium scrub) failed: {e}");
+                        match item.inner.clear_visible_region() {
+                            Ok(()) => item.last_clip = None,
+                            Err(e) => warn!("clear_visible_region (chromium scrub) failed: {e}"),
                         }
-                        item.last_clip = None;
                     }
                     continue;
                 }
                 if d.fully_offscreen {
                     if item.last_clip.is_some() {
-                        if let Err(e) = item.inner.clear_visible_region() {
-                            warn!("clear_visible_region (park transition) failed: {e}");
+                        match item.inner.clear_visible_region() {
+                            Ok(()) => item.last_clip = None,
+                            Err(e) => warn!("clear_visible_region (park transition) failed: {e}"),
                         }
-                        item.last_clip = None;
                     }
                 } else if d.clip.is_none() {
                     if item.last_clip.is_some() {
-                        if let Err(e) = item.inner.clear_visible_region() {
-                            warn!("clear_visible_region (fully-visible transition) failed: {e}");
+                        match item.inner.clear_visible_region() {
+                            Ok(()) => item.last_clip = None,
+                            Err(e) => warn!("clear_visible_region (fully-visible transition) failed: {e}"),
                         }
-                        item.last_clip = None;
                     }
                 } else if let Some(next_clip) = d.clip {
                     if item.last_clip != Some(next_clip) {

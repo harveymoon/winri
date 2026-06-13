@@ -42,6 +42,12 @@ pub struct State {
     /// every visible app window onto the tiling monitor — so a fresh session
     /// always starts with a clean, consolidated tile strip.
     pub(crate) pending_initial_consolidation: bool,
+    /// Set synchronously by `prepare_open_overview`, cleared by
+    /// `finalize_open_overview` (success or error). Closes the window between
+    /// "overview-window-creation task queued" and "Mode::Overview committed"
+    /// during which a queued `Win+,` would otherwise slip past the settings
+    /// guard — the May 2026 freeze-cascade incident.
+    pub(crate) overview_opening: bool,
 }
 
 pub enum Mode {
@@ -183,6 +189,7 @@ impl State {
                 settings_window_id: None,
                 settings_form: settings::SettingsForm::default(),
                 pending_initial_consolidation: true,
+                overview_opening: false,
             },
             overlay_window_creation_task,
         )
@@ -191,6 +198,20 @@ impl State {
     fn open_settings(&mut self) -> Task<Message> {
         if let Some(existing) = self.settings_window_id {
             return iced::window::gain_focus(existing);
+        }
+        // Refuse to open settings on top of an active overview. Same
+        // freeze-cascade reasoning as the symmetric guard in
+        // `prepare_open_overview`: the two transient UIs racing into
+        // existence leaves no clear recovery path. Close overview
+        // first (Win+Esc / Win+Down), then reopen settings.
+        //
+        // `overview_opening` covers the gap between the overview-window
+        // creation tasks being queued and `Mode::Overview` being committed
+        // in `finalize_open_overview`. Without it, queued `Win+Up`/`Win+,`
+        // hotkeys could still race past this guard.
+        if matches!(self.mode, Mode::Overview(_)) || self.overview_opening {
+            log::warn!("Settings suppressed: overview is open. Close overview first.");
+            return Task::none();
         }
         let current_windows = self.snapshot_tiled_windows_for_settings();
         self.settings_form = settings::SettingsForm::from_current_config(current_windows);

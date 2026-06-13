@@ -185,6 +185,9 @@ Bugs, perf work, and features that landed on this fork's `dev`:
 - **Control API** (`INTEGRATION.md`): `/state`, `/windows`, `/scroll` (now with `animate_ms`), `/windows/{id}/resize` (with `animate_ms` + `center`), `/windows/{id}/wake`, `GET /events` SSE push channel
 - **Animated drag-resize**: dragging a tile's left edge animates the scroll instead of jumping the right edge
 - **Width-cache trust**: `update_widths` rejects large bounds-vs-cache deltas at rest (Chrome / Electron / TouchDesigner no longer get stomped to natural width on first snapshot)
+- **DWM restart survival**: `E_HANDLE` floods from `DwmGetWindowAttribute` (graphics driver reset, dwm.exe crash) are detected, calls back off for 250 ms, and the cached `IVirtualDesktopManager` proxy is dropped so the next caller rebuilds against fresh dwm.exe instead of holding a stale COM proxy that blows up at shutdown
+- **Hung-app guard**: `SetWindowRgn` / clip-clear skip windows that don't pong a 50 ms `WM_NULL` probe, so one frozen Chrome window can't stall the whole tiler (29 s freeze observed before the guard); failed clears now leave `WindowItem.last_clip` set so the next layout pass retries instead of leaving the window visually truncated
+- **Settings/overview symmetric guard**: synchronous `overview_opening` flag covers the async gap between queueing the overview window-creation tasks and committing `Mode::Overview`, closing the May 2026 freeze-cascade in both hotkey orderings
 
 ## Disclaimer
 
